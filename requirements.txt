@@ -1,7 +1,6 @@
 # Dependências iniciais do backend (Python)
 # Manter a lista enxuta; adicionar bibliotecas somente quando forem usadas.
-fastapi>=0.115,<1.0
-uvicorn[standard]>=0.30,<1.0
+
 neo4j>=5.26,<7.0
 pydantic-settings>=2.6,<3.0
 python-dotenv>=1.0,<2.0
@@ -15,4 +14,6 @@ sentence-transformers>=3.3,<6.0
 
 # Testes
 pytest>=8.0,<9.0
-httpx>=0.27,<1.0
+
+#Internface
+streamlit
