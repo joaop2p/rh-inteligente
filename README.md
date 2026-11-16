@@ -205,6 +205,18 @@ Antes da ingestão, confirmar versão do Neo4j, modelo de embeddings/dimensão e
 
 > Os passos 4–9 dependem de scripts/arquivos que ainda precisam ser implementados ou configurados. Não há comando de inicialização da API documentado enquanto a estrutura executável não existir.
 
+### Importação de chunks e embeddings
+
+Depois de importar os nós `Documento`, gere e valide os chunks com:
+
+```bash
+.venv/bin/python -m src.ingestion.import_chunks \
+  --data-dir documents/downloads/novatech_proximos_passos_lpg/dataset_saneado_corrigido/dataset_saneado \
+  --limit-documents 3
+```
+
+O comando é um *dry-run* para os três primeiros documentos do índice; remova `--limit-documents` para processar todos. CPF formatado e valores monetários precedidos por `R$` são mascarados antes de gerar embeddings, inclusive valores de benefícios. Essa sanitização não substitui uma revisão de privacidade. Para gravar `Chunk`, `embedding` e `TEM_TRECHO` no Neo4j, configure `NEO4J_URI` e `NEO4J_PASSWORD` no `.env` e acrescente `--apply`.
+
 ## 10. Estrutura sugerida do repositório
 
 ```text
