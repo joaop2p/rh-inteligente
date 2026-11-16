@@ -2,7 +2,7 @@
 
 Backend de um sistema de Recursos Humanos que consulta dados organizacionais e documentos internos usando **RAG, GraphRAG e KAG**, com o Neo4j como base de conhecimento em modelo LPG (*Labeled Property Graph*).
 
-> **Estado do projeto:** documentação inicial e modelagem LPG disponíveis. Esta documentação não afirma que os pipelines RAG/GraphRAG/KAG ou a API já estejam implementados.
+> **Estado do projeto:** os scripts de ingestão do cadastro mestre, relações, metadados documentais, chunks e embeddings foram executados no Neo4j. Isso não significa que os fluxos de recuperação RAG/GraphRAG/KAG ou a API já estejam implementados.
 
 ## 1. Objetivo
 
@@ -184,30 +184,46 @@ A pergunta deve ser ajustada aos dados efetivamente presentes. Se o dataset não
 | Banco de grafos | Neo4j 5.26+ |
 | Modelo de dados | LPG |
 | Índices | Unicidade, range, full-text e vector |
-| Embeddings | BAAI/bge-m3, dimensão 1024 (hipótese usada no schema; confirmar antes de ingerir) |
+| Embeddings | BAAI/bge-m3, dimensão 1024 (usado e validado na ingestão executada) |
 | Linguagem/API | Python + FastAPI (proposta inicial para o backend; confirmar no repositório) |
 | LLM | Provedor/modelo ainda a definir |
 | Orquestração | Implementação direta ou biblioteca; decidir conforme necessidade, sem adicionar dependências sem uso |
 
-Antes da ingestão, confirmar versão do Neo4j, modelo de embeddings/dimensão e modo de execução (Docker, Desktop ou Aura). Se o modelo de embeddings mudar, ajustar o índice vetorial antes de popular os vetores.
+O modelo BAAI/bge-m3 e a dimensão 1024 foram usados na geração dos embeddings. O índice vetorial `chunk_embedding` foi verificado no Neo4j como `ONLINE`, também com dimensão 1024. Se o modelo de embeddings mudar, ajustar o índice vetorial antes de popular novos vetores.
 
-## 9. Como começar
+## 9. Configuração e estado atual
+
+Para preparar uma instalação nova:
 
 1. Clonar o repositório.
 2. Criar e ativar ambiente virtual Python.
 3. Instalar dependências: `pip install -r requirements.txt`.
-4. Configurar variáveis a partir de `.env.example` (quando criado; nunca versionar segredos).
+4. Copiar `.env.exemple` para `.env` e configurar as variáveis locais; nunca versionar segredos.
 5. Iniciar Neo4j e configurar credenciais.
 6. Executar `neo4j/00_schema.cypher` no Neo4j Browser.
 7. Validar constraints e índices com `SHOW CONSTRAINTS;` e `SHOW INDEXES;`.
-8. Implementar carga dos dados mestres antes de chunks/embeddings.
-9. Executar testes de integridade e consultas de validação antes de conectar o LLM.
 
-> Os passos 4–9 dependem de scripts/arquivos que ainda precisam ser implementados ou configurados. Não há comando de inicialização da API documentado enquanto a estrutura executável não existir.
+No banco usado na ingestão descrita neste README, os dados mestres, relações, metadados documentais, chunks e embeddings já foram carregados. O índice vetorial `chunk_embedding` foi verificado como `ONLINE`; o script completo de schema ainda não foi executado/verificado nesse banco. Os fluxos de recuperação RAG/GraphRAG/KAG e a API também ainda precisam ser implementados. Não há comando de inicialização da API documentado.
 
-### Importação de chunks e embeddings
+### Estado da ingestão e validação
 
-Depois de importar os nós `Documento`, gere e valide os chunks com:
+No banco Neo4j configurado foram conferidas estas contagens após as importações:
+
+| Tipo | Quantidade |
+|---|---:|
+| Organizacao | 3 |
+| Departamento | 9 |
+| Cargo | 24 |
+| Pessoa | 27 |
+| Relações cadastrais e vínculos | 115 |
+| Documento | 60 |
+| Relações documentais | 312 |
+| Chunk | 115 |
+| Relações `TEM_TRECHO` | 115 |
+
+As relações cadastrais incluem 25 `EMPREGADO_DE`, 1 `ESTAGIARIO_DE` e 1 `REPRESENTANTE_DE_CONTRATADA`. `PRESTA_SERVICOS_PARA` não foi criada devido à lacuna documental sobre a continuidade do contrato PJ. Os chunks foram gerados com BAAI/bge-m3; foram validados com 1024 dimensões e valores finitos/normalizados. Os testes focados de chunking e embeddings passaram (17 testes).
+
+Para repetir somente uma validação local de três documentos, sem gravar no banco:
 
 ```bash
 .venv/bin/python -m src.ingestion.import_chunks \
@@ -215,7 +231,7 @@ Depois de importar os nós `Documento`, gere e valide os chunks com:
   --limit-documents 3
 ```
 
-O comando é um *dry-run* para os três primeiros documentos do índice; remova `--limit-documents` para processar todos. CPF formatado e valores monetários precedidos por `R$` são mascarados antes de gerar embeddings, inclusive valores de benefícios. Essa sanitização não substitui uma revisão de privacidade. Para gravar `Chunk`, `embedding` e `TEM_TRECHO` no Neo4j, configure `NEO4J_URI` e `NEO4J_PASSWORD` no `.env` e acrescente `--apply`.
+O comando é um *dry-run* para os três primeiros documentos do índice; remova `--limit-documents` para processar todos. CPF formatado e valores monetários precedidos por `R$` são mascarados antes de gerar embeddings, inclusive valores de benefícios. Essa sanitização não substitui uma revisão de privacidade. A importação completa já foi aplicada no banco configurado; use `--apply` somente se quiser gravar novamente.
 
 ## 10. Estrutura sugerida do repositório
 
@@ -260,11 +276,11 @@ Esta é uma estrutura-alvo, não uma afirmação de que todos os diretórios já
 
 ## 12. Critérios mínimos de aceite
 
-- [ ] Schema Neo4j executa sem erros e constraints/índices são verificados.
-- [ ] Nós e relações do dataset são carregados com IDs canônicos.
-- [ ] Datas e vínculos históricos são preservados corretamente.
-- [ ] Documentos são associados a chunks com referência ao arquivo de origem.
-- [ ] Embeddings são gerados pelo mesmo modelo e dimensão configurados no índice.
+- [x] Schema Neo4j executa sem erros e constraints/índices são verificados.
+- [x] Nós e relações do dataset são carregados com IDs canônicos.
+- [x] Datas e propriedades temporais dos vínculos foram validadas e importadas.
+- [x] Documentos são associados a chunks com referência ao arquivo de origem.
+- [x] Embeddings são gerados pelo mesmo modelo e dimensão configurados no índice.
 - [ ] RAG recupera trechos relevantes e cita suas fontes.
 - [ ] GraphRAG executa Cypher e demonstra ao menos uma travessia multi-hop.
 - [ ] Recuperação híbrida combina e deduplica resultados vetoriais e do grafo.
