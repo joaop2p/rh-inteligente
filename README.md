@@ -186,7 +186,7 @@ A pergunta deve ser ajustada aos dados efetivamente presentes. Se o dataset não
 | Índices | Unicidade, range, full-text e vector |
 | Embeddings | BAAI/bge-m3, dimensão 1024 (usado e validado na ingestão executada) |
 | Linguagem/API | Python + FastAPI (proposta inicial para o backend; confirmar no repositório) |
-| LLM | Provedor/modelo ainda a definir |
+| LLM | Ollama remoto via Tailscale, configurado por `TAILSCALE_MODEL_HOST` |
 | Orquestração | Implementação direta ou biblioteca; decidir conforme necessidade, sem adicionar dependências sem uso |
 
 O modelo BAAI/bge-m3 e a dimensão 1024 foram usados na geração dos embeddings. O índice vetorial `chunk_embedding` foi verificado no Neo4j como `ONLINE`, também com dimensão 1024. Se o modelo de embeddings mudar, ajustar o índice vetorial antes de popular novos vetores.
@@ -204,6 +204,42 @@ Para preparar uma instalação nova:
 7. Validar constraints e índices com `SHOW CONSTRAINTS;` e `SHOW INDEXES;`.
 
 No banco usado na ingestão descrita neste README, os dados mestres, relações, metadados documentais, chunks e embeddings já foram carregados. O índice vetorial `chunk_embedding` foi verificado como `ONLINE`; o script completo de schema ainda não foi executado/verificado nesse banco. Os fluxos de recuperação RAG/GraphRAG/KAG e a API também ainda precisam ser implementados. Não há comando de inicialização da API documentado.
+
+O acesso ao Neo4j está encapsulado em `src/database/neo4j.py`, com transações de leitura/escrita e parâmetros Cypher separados da consulta. A geração em `src/generation/llm.py` usa a API nativa de chat do Ollama no host indicado por `TAILSCALE_MODEL_HOST` (URL ou host/porta, normalmente com a porta padrão do Ollama). Se houver exatamente um modelo instalado, ele é selecionado automaticamente. Com mais de um modelo, informe `model_name` ao criar `OllamaClient`.
+
+Exemplo de uso:
+
+```python
+from src.database.neo4j import Neo4jDatabase
+from src.generation.llm import OllamaClient
+
+with Neo4jDatabase.from_env() as graph:
+    graph.verify_connectivity()
+    people = graph.execute_read(
+        "MATCH (p:Pessoa {funcionario_id: $id}) RETURN p.nome AS nome",
+        {"id": "E001"},
+    )
+
+answer = OllamaClient.from_env().chat([
+    {"role": "user", "content": "Responda apenas: conexão validada."}
+])
+```
+
+O conteúdo enviado a `OllamaClient.chat` é transmitido ao servidor configurado em Tailscale. Não envie documentos ou dados pessoais sem autorização e avaliação de privacidade.
+
+Para conversar com o modelo em modo de teste, execute na raiz do projeto:
+
+```bash
+.venv/bin/python -m src.generation.chat_cli
+```
+
+Digite `/sair` para encerrar. A conversa mantém o histórico em memória durante a sessão, mas **não consulta o Neo4j nem usa RAG**; respostas sobre o dataset não são fundamentadas. Se o servidor tiver mais de um modelo, acrescente `--model NOME_DO_MODELO`. Não envie dados sensíveis.
+
+Para executar os testes unitários:
+
+```bash
+.venv/bin/pytest -q
+```
 
 ### Estado da ingestão e validação
 
@@ -288,6 +324,8 @@ Esta é uma estrutura-alvo, não uma afirmação de que todos os diretórios já
 - [ ] API retorna fontes, nós, arestas, Cypher e métricas disponíveis.
 - [ ] Quando não há evidência, o sistema declara a insuficiência em vez de fabricar resposta.
 - [ ] Testes cobrem casos positivos, ausência de evidência e relações temporais.
+
+Os testes unitários de `Neo4jDatabase` e `OllamaClient` usam drivers/respostas simulados; uma verificação de integração deve ser feita separadamente com o Neo4j e o servidor Ollama configurados.
 
 ## 13. Referências internas
 
