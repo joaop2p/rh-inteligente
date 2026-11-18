@@ -52,6 +52,24 @@ ORDER BY funcionario_id
 LIMIT 2
 """
 
+# A proveniência de cada REPORTS_TO é o documento citado em valid_*_fonte.
+_SOURCE_DOCS = """(
+    CASE
+        WHEN path_relationship.valid_from_fonte IS :: STRING
+            THEN [path_relationship.valid_from_fonte]
+        WHEN path_relationship.valid_from_fonte IS :: LIST<STRING>
+            THEN path_relationship.valid_from_fonte
+        ELSE []
+    END
+    + CASE
+        WHEN path_relationship.valid_to_fonte IS :: STRING
+            THEN [path_relationship.valid_to_fonte]
+        WHEN path_relationship.valid_to_fonte IS :: LIST<STRING>
+            THEN path_relationship.valid_to_fonte
+        ELSE []
+    END
+)"""
+
 REPORTING_CHAIN_QUERY = """
 MATCH (manager:Pessoa {funcionario_id: $manager_id})
 MATCH path=(subordinate:Pessoa)-[reports:REPORTS_TO*1..__MAX_HOPS__]->(manager)
@@ -78,12 +96,10 @@ WITH
     subordinate,
     nodes(path) AS path_nodes,
     relationships(path) AS path_relationships
-UNWIND path_nodes AS path_person
+UNWIND path_relationships AS path_relationship
 OPTIONAL MATCH (document:Documento)-[:TEM_TRECHO]->(chunk:Chunk)
-OPTIONAL MATCH
-    (document)-[:REFERE_SE_A|ASSINADO_POR|ENVOLVE]->(path_person)
 WHERE
-    chunk IS NOT NULL
+    document.doc_id IN __SOURCE_DOCS__
     AND ($document_scope IS NULL OR document.escopo = $document_scope)
 WITH
     path,
@@ -96,7 +112,7 @@ WITH
             doc_id: chunk.doc_id,
             chunk_id: chunk.chunk_id,
             text: chunk.texto,
-            funcionario_id: path_person.funcionario_id
+            funcionario_id: startNode(path_relationship).funcionario_id
         }
     END) AS evidence
 RETURN
@@ -115,7 +131,121 @@ RETURN
     }] AS path_relationships,
     evidence
 ORDER BY length(path), subordinate.nome, subordinate.funcionario_id
-""".replace("__MAX_HOPS__", str(MAX_HOPS))
+""".replace("__MAX_HOPS__", str(MAX_HOPS)).replace("__SOURCE_DOCS__", _SOURCE_DOCS)
+
+_PATH_RETURN = """
+RETURN
+    [person IN path_nodes | {
+        funcionario_id: person.funcionario_id,
+        nome: person.nome
+    }] AS path_nodes,
+    [relation IN path_relationships | {
+        relacao_id: relation.relacao_id,
+        source_id: startNode(relation).funcionario_id,
+        target_id: endNode(relation).funcionario_id,
+        valid_from: toString(relation.valid_from),
+        valid_to: toString(relation.valid_to),
+        valid_from_fonte: relation.valid_from_fonte,
+        valid_to_fonte: relation.valid_to_fonte
+    }] AS path_relationships,
+    evidence
+"""
+
+# Cadeia ascendente (pessoa -> gestores): o caminho mais longo vigente em as_of.
+MANAGEMENT_CHAIN_QUERY = """
+MATCH (person:Pessoa {funcionario_id: $person_id})
+MATCH path=(person)-[reports:REPORTS_TO*1..__MAX_HOPS__]->(top:Pessoa)
+WHERE all(
+    relation IN reports
+    WHERE relation.valid_from <= date($as_of)
+      AND (relation.valid_to IS NULL OR relation.valid_to >= date($as_of))
+)
+WITH person AS subordinate, path
+ORDER BY length(path) DESC
+LIMIT 1
+WITH
+    path,
+    subordinate,
+    nodes(path) AS path_nodes,
+    relationships(path) AS path_relationships
+UNWIND path_relationships AS path_relationship
+OPTIONAL MATCH (document:Documento)-[:TEM_TRECHO]->(chunk:Chunk)
+WHERE
+    document.doc_id IN __SOURCE_DOCS__
+    AND ($document_scope IS NULL OR document.escopo = $document_scope)
+WITH
+    path,
+    path_nodes,
+    path_relationships,
+    subordinate,
+    collect(DISTINCT CASE
+        WHEN chunk IS NULL THEN null
+        ELSE {
+            doc_id: chunk.doc_id,
+            chunk_id: chunk.chunk_id,
+            text: chunk.texto,
+            funcionario_id: startNode(path_relationship).funcionario_id
+        }
+    END) AS evidence
+""" + _PATH_RETURN
+MANAGEMENT_CHAIN_QUERY = MANAGEMENT_CHAIN_QUERY.replace(
+    "__MAX_HOPS__", str(MAX_HOPS)
+).replace("__SOURCE_DOCS__", _SOURCE_DOCS)
+
+# Menor caminho não direcionado em REPORTS_TO vigente, para relacionar duas pessoas.
+SHORTEST_PATH_QUERY = """
+MATCH (start:Pessoa {funcionario_id: $start_id})
+MATCH (end:Pessoa {funcionario_id: $end_id})
+MATCH path=shortestPath((start)-[:REPORTS_TO*1..__MAX_HOPS__]-(end))
+WHERE all(
+    relation IN relationships(path)
+    WHERE relation.valid_from <= date($as_of)
+      AND (relation.valid_to IS NULL OR relation.valid_to >= date($as_of))
+)
+WITH
+    path,
+    start AS subordinate,
+    nodes(path) AS path_nodes,
+    relationships(path) AS path_relationships
+UNWIND path_relationships AS path_relationship
+OPTIONAL MATCH (document:Documento)-[:TEM_TRECHO]->(chunk:Chunk)
+WHERE
+    document.doc_id IN __SOURCE_DOCS__
+    AND ($document_scope IS NULL OR document.escopo = $document_scope)
+WITH
+    path,
+    path_nodes,
+    path_relationships,
+    subordinate,
+    collect(DISTINCT CASE
+        WHEN chunk IS NULL THEN null
+        ELSE {
+            doc_id: chunk.doc_id,
+            chunk_id: chunk.chunk_id,
+            text: chunk.texto,
+            funcionario_id: startNode(path_relationship).funcionario_id
+        }
+    END) AS evidence
+""" + _PATH_RETURN
+SHORTEST_PATH_QUERY = SHORTEST_PATH_QUERY.replace(
+    "__MAX_HOPS__", str(MAX_HOPS)
+).replace("__SOURCE_DOCS__", _SOURCE_DOCS)
+
+CARGO_EVIDENCE_QUERY = """
+MATCH (p:Pessoa {funcionario_id: $funcionario_id})-[position:OCUPA_CARGO]->(cargo:Cargo)
+WHERE toLower(trim(cargo.cargo_canonico)) IN $cargo_titles
+  AND position.valid_from <= date($as_of)
+  AND (position.valid_to IS NULL OR position.valid_to >= date($as_of))
+UNWIND coalesce(position.fonte_doc_ids, []) AS source_doc_id
+MATCH (document:Documento {doc_id: source_doc_id})-[:TEM_TRECHO]->(chunk:Chunk)
+WHERE $document_scope IS NULL OR document.escopo = $document_scope
+RETURN DISTINCT
+    chunk.doc_id AS doc_id,
+    chunk.chunk_id AS chunk_id,
+    chunk.texto AS text,
+    p.funcionario_id AS funcionario_id
+ORDER BY doc_id, chunk_id
+"""
 
 DOCUMENT_METADATA_SEARCH_QUERY = """
 MATCH (document:Documento)-[:TEM_TRECHO]->(chunk:Chunk)
@@ -315,7 +445,11 @@ def _parse_relationship(record: Mapping[str, Any]) -> GraphRelationship:
     )
 
 
-def _parse_path(record: Mapping[str, Any]) -> GraphPath:
+def _parse_path(
+    record: Mapping[str, Any],
+    *,
+    allow_reverse: bool = False,
+) -> GraphPath:
     raw_people = record.get("path_nodes")
     raw_relationships = record.get("path_relationships")
     if not isinstance(raw_people, list) or not isinstance(raw_relationships, list):
@@ -340,10 +474,17 @@ def _parse_path(record: Mapping[str, Any]) -> GraphPath:
             "O caminho não contém pessoas e relações alinhadas."
         )
     for index, relationship in enumerate(relationships):
-        if (
-            relationship.source_id != people[index].funcionario_id
-            or relationship.target_id != people[index + 1].funcionario_id
-        ):
+        current_id = people[index].funcionario_id
+        next_id = people[index + 1].funcionario_id
+        aligned = (
+            relationship.source_id == current_id
+            and relationship.target_id == next_id
+        )
+        reversed_ = (
+            relationship.source_id == next_id
+            and relationship.target_id == current_id
+        )
+        if not (aligned or (allow_reverse and reversed_)):
             raise GraphSearchDataError(
                 "A direção de uma relação não corresponde ao caminho retornado."
             )
@@ -424,7 +565,7 @@ def _document_topic_type(text: str) -> str | None:
     normalized = _normalize_search_text(text)
     if any(
         term in normalized
-        for term in ("desligamento", "rescisao", "demissao")
+        for term in ("desligamento", "desligad", "rescisao", "demissao", "demitid")
     ):
         return "desligamento"
     if "ferias" in normalized:
@@ -658,26 +799,124 @@ class GraphSearch:
                 "document_scope": document_scope,
             },
         )
-        paths = tuple(_parse_path(record) for record in records)
+        return self._result(records, REPORTING_CHAIN_QUERY, as_of)
+
+    def management_chain(
+        self,
+        person_id: str,
+        *,
+        as_of: date,
+        document_scope: str | None = None,
+    ) -> GraphSearchResult:
+        """Sobe REPORTS_TO a partir da pessoa até o topo vigente em as_of."""
+        self._validate_search(person_id, as_of, document_scope)
+        records = self._database.execute_read(
+            MANAGEMENT_CHAIN_QUERY,
+            {
+                "person_id": person_id.strip(),
+                "as_of": as_of.isoformat(),
+                "document_scope": document_scope,
+            },
+        )
+        return self._result(records, MANAGEMENT_CHAIN_QUERY, as_of)
+
+    def shortest_path(
+        self,
+        start_id: str,
+        end_id: str,
+        *,
+        as_of: date,
+        document_scope: str | None = None,
+    ) -> GraphSearchResult:
+        """Menor caminho vigente em REPORTS_TO entre duas pessoas."""
+        self._validate_search(start_id, as_of, document_scope)
+        self._validate_search(end_id, as_of, document_scope)
+        records = self._database.execute_read(
+            SHORTEST_PATH_QUERY,
+            {
+                "start_id": start_id.strip(),
+                "end_id": end_id.strip(),
+                "as_of": as_of.isoformat(),
+                "document_scope": document_scope,
+            },
+        )
+        return self._result(
+            records, SHORTEST_PATH_QUERY, as_of, allow_reverse=True
+        )
+
+    def cargo_evidence(
+        self,
+        person_id: str,
+        cargo_titles: tuple[str, ...],
+        *,
+        as_of: date,
+        document_scope: str | None = None,
+    ) -> tuple[GraphEvidence, ...]:
+        """Chunks dos documentos que sustentam a ocupação do cargo."""
+        self._validate_search(person_id, as_of, document_scope)
+        records = self._database.execute_read(
+            CARGO_EVIDENCE_QUERY,
+            {
+                "funcionario_id": person_id.strip(),
+                "cargo_titles": [title.strip().casefold() for title in cargo_titles],
+                "as_of": as_of.isoformat(),
+                "document_scope": document_scope,
+            },
+        )
+        return _parse_evidence(
+            [
+                {
+                    "doc_id": record.get("doc_id"),
+                    "chunk_id": record.get("chunk_id"),
+                    "text": record.get("text"),
+                    "funcionario_id": record.get("funcionario_id"),
+                }
+                for record in records
+            ]
+        )
+
+    @staticmethod
+    def _validate_search(
+        person_id: str,
+        as_of: date,
+        document_scope: str | None,
+    ) -> None:
+        if not isinstance(person_id, str) or not person_id.strip():
+            raise ValueError("O ID da pessoa deve ser um texto não vazio.")
+        if not isinstance(as_of, date) or isinstance(as_of, datetime):
+            raise ValueError("as_of deve ser datetime.date.")
+        if document_scope is not None and document_scope not in DOCUMENT_SCOPES:
+            raise ValueError("document_scope deve ser ORGANIZACAO, PESSOA ou None.")
+
+    @staticmethod
+    def _result(
+        records: list[dict[str, Any]],
+        cypher: str,
+        as_of: date,
+        *,
+        allow_reverse: bool = False,
+    ) -> GraphSearchResult:
+        paths = tuple(
+            _parse_path(record, allow_reverse=allow_reverse)
+            for record in records
+        )
         evidence_by_key: dict[tuple[str, str, str], GraphEvidence] = {}
         for record in records:
             for item in _parse_evidence(record.get("evidence")):
                 evidence_by_key[
                     (item.doc_id, item.chunk_id, item.funcionario_id)
                 ] = item
-        evidence = tuple(
-            evidence_by_key[key]
-            for key in sorted(evidence_by_key)
-        )
+        evidence = tuple(evidence_by_key[key] for key in sorted(evidence_by_key))
         return GraphSearchResult(
             paths=paths,
             evidence=evidence,
-            cypher=REPORTING_CHAIN_QUERY,
+            cypher=cypher,
             as_of=as_of,
         )
 
 
 __all__ = [
+    "CARGO_EVIDENCE_QUERY",
     "CARGO_OCCUPANTS_QUERY",
     "DocumentEvidence",
     "DOCUMENT_METADATA_SEARCH_QUERY",
@@ -693,6 +932,9 @@ __all__ = [
     "GraphSearchError",
     "GraphSearchResult",
     "MAX_HOPS",
+    "MANAGEMENT_CHAIN_QUERY",
     "MAX_PATHS",
+    "REPORTING_CHAIN_QUERY",
+    "SHORTEST_PATH_QUERY",
     "PEOPLE_DIRECTORY_QUERY",
 ]

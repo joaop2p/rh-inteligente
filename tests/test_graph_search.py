@@ -11,7 +11,9 @@ from src.retrieval.graph_search import (
     PERSON_BY_EXACT_NAME_QUERY,
     PERSON_BY_ID_QUERY,
     PEOPLE_DIRECTORY_QUERY,
+    MANAGEMENT_CHAIN_QUERY,
     REPORTING_CHAIN_QUERY,
+    SHORTEST_PATH_QUERY,
     GraphEntityAmbiguousError,
     GraphEntityNotFoundError,
     GraphCargoOccupant,
@@ -54,7 +56,11 @@ class FakeGraphDatabase:
             return self.manager_matches
         if query == PEOPLE_DIRECTORY_QUERY:
             return self.people
-        if query == REPORTING_CHAIN_QUERY:
+        if query in {
+            REPORTING_CHAIN_QUERY,
+            MANAGEMENT_CHAIN_QUERY,
+            SHORTEST_PATH_QUERY,
+        }:
             return self.path_records
         raise AssertionError(f"Consulta não permitida: {query}")
 
@@ -327,3 +333,73 @@ def test_reporting_chain_rejects_paths_with_inconsistent_edge_direction() -> Non
             "E-007",
             as_of=date(2025, 1, 1),
         )
+
+
+def test_reporting_chain_evidence_comes_only_from_relationship_source_documents() -> None:
+    assert "valid_from_fonte" in REPORTING_CHAIN_QUERY
+    assert "document.doc_id IN" in REPORTING_CHAIN_QUERY
+    # Regressão: o produto cartesiano Documento×Chunk devolvia todos os chunks.
+    assert "OPTIONAL MATCH (document:Documento)-[:TEM_TRECHO]->(chunk:Chunk)\nOPTIONAL" not in REPORTING_CHAIN_QUERY
+
+
+def test_management_chain_is_parametrized_upward_traversal() -> None:
+    database = FakeGraphDatabase(path_records=[_path_record()])
+
+    result = GraphSearch(database).management_chain(
+        "E-015",
+        as_of=date(2025, 1, 1),
+    )
+
+    assert [person.funcionario_id for person in result.paths[0].people] == [
+        "E-015",
+        "E-013",
+        "E-007",
+    ]
+    assert database.calls[-1] == (
+        MANAGEMENT_CHAIN_QUERY,
+        {"person_id": "E-015", "as_of": "2025-01-01", "document_scope": None},
+    )
+    assert "E-015" not in MANAGEMENT_CHAIN_QUERY
+
+
+def test_shortest_path_accepts_edges_traversed_against_their_direction() -> None:
+    record = {
+        "path_nodes": [
+            {"funcionario_id": "E-A", "nome": "A"},
+            {"funcionario_id": "E-B", "nome": "B"},
+            {"funcionario_id": "E-C", "nome": "C"},
+        ],
+        "path_relationships": [
+            {
+                "relacao_id": "REL-A-B",
+                "source_id": "E-A",
+                "target_id": "E-B",
+                "valid_from": "2024-01-01",
+                "valid_to": None,
+            },
+            {
+                "relacao_id": "REL-C-B",
+                "source_id": "E-C",
+                "target_id": "E-B",
+                "valid_from": "2024-01-01",
+                "valid_to": None,
+            },
+        ],
+        "evidence": [],
+    }
+    database = FakeGraphDatabase(path_records=[record])
+
+    result = GraphSearch(database).shortest_path(
+        "E-A", "E-C", as_of=date(2025, 1, 1)
+    )
+
+    assert [person.nome for person in result.paths[0].people] == ["A", "B", "C"]
+    assert "shortestPath" in SHORTEST_PATH_QUERY
+    # A busca estrita de subordinados continua exigindo caminhos alinhados.
+    with pytest.raises(GraphSearchDataError):
+        GraphSearch(
+            FakeGraphDatabase(
+                manager_matches=[{"funcionario_id": "E-C", "nome": "C"}],
+                path_records=[record],
+            )
+        ).reporting_chain("E-C", as_of=date(2025, 1, 1))
