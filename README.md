@@ -2,7 +2,7 @@
 
 Aplicação monolítica em Python e Streamlit para consultas de Recursos Humanos, com Neo4j como base de conhecimento em modelo LPG (*Labeled Property Graph*) e previsão de fluxos **RAG, GraphRAG e KAG**.
 
-> **Estado do projeto:** os scripts de ingestão do cadastro mestre, relações, metadados documentais, chunks e embeddings foram executados no Neo4j. A recuperação híbrida e o pipeline RAG com proveniência estão conectados ao modo RAG do Streamlit, com exibição das fontes. GraphRAG, KAG, visualização de caminhos e persistência de conversas ainda não estão implementados.
+> **Estado do projeto:** os scripts de ingestão do cadastro mestre, relações, metadados documentais, chunks e embeddings foram executados no Neo4j. A recuperação híbrida e o pipeline RAG com proveniência estão conectados ao modo RAG do Streamlit, com exibição das fontes. Conversas diretas e RAG podem ser salvas localmente em arquivos Markdown criptografados; GraphRAG, KAG e visualização de caminhos continuam pendentes.
 
 ## 1. Objetivo
 
@@ -183,7 +183,7 @@ A pergunta deve ser ajustada aos dados efetivamente presentes. Se o dataset não
 |---|---|
 | Banco de grafos | Neo4j 5.26+ |
 | Modelo de dados | LPG |
-| Índices | Unicidade, range, full-text e vector |
+| Índices | Unicidade, full-text de chunks e vetor de embeddings; demais índices conforme demanda |
 | Embeddings | BAAI/bge-m3, dimensão 1024 (usado e validado na ingestão executada) |
 | Aplicação | Python + Streamlit, arquitetura monolítica |
 | LLM | Ollama remoto via Tailscale, configurado por `TAILSCALE_MODEL_HOST` |
@@ -198,12 +198,18 @@ Para preparar uma instalação nova:
 1. Clonar o repositório.
 2. Criar e ativar ambiente virtual Python.
 3. Instalar dependências: `pip install -r requirements.txt`.
-4. Copiar `.env.exemple` para `.env` e configurar as variáveis locais; nunca versionar segredos.
+4. Copiar `.env.exemple` para `.env` e configurar as variáveis locais; nunca versionar segredos. Para persistir conversas, gere uma chave Fernet e preencha `RH_CONVERSATION_ENCRYPTION_KEY`:
+
+   ```bash
+   .venv/bin/python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'
+   ```
+
+   Gere a chave uma única vez e mantenha-a em segurança: sem ela, as conversas salvas não podem ser lidas.
 5. Iniciar Neo4j e configurar credenciais.
-6. Executar `neo4j/00_schema.cypher` no Neo4j Browser.
+6. Executar `neo4j/00_schema.cypher` no Neo4j Browser. O script cria as seis constraints de unicidade usadas pelos IDs canônicos, o índice vetorial `chunk_embedding` (`Chunk.embedding`, 1024 dimensões, cosseno) e o índice full-text `chunk_fulltext` (`Chunk.texto`), todos com `IF NOT EXISTS`. O importador de metadados grava `Documento.escopo`, usado como filtro pelas consultas de busca.
 7. Validar constraints e índices com `SHOW CONSTRAINTS;` e `SHOW INDEXES;`.
 
-No banco usado na ingestão descrita neste README, os dados mestres, relações, metadados documentais, chunks e embeddings já foram carregados. Os índices `chunk_embedding` e `chunk_fulltext` foram verificados como `ONLINE`; o script completo de schema ainda não foi executado/verificado nesse banco. O modo RAG está conectado ao backend e à interface; uma validação manual do fluxo real no navegador ainda é recomendada.
+Os documentos de modelagem e auditoria estão versionados em `docs/`. O dataset saneado permanece em `documents/`, que é ignorado pelo Git, e deve ser obtido separadamente para reproduzir a ingestão. No banco usado na ingestão descrita neste README, os dados mestres, relações, metadados documentais, chunks e embeddings já foram carregados. Os índices `chunk_embedding` e `chunk_fulltext` foram verificados como `ONLINE`; o schema versionado ainda não foi executado/verificado nesse banco. O modo RAG está conectado ao backend e à interface; uma validação manual do fluxo real no navegador ainda é recomendada.
 
 ### Executar a interface
 
@@ -213,7 +219,9 @@ Com o Ollama acessível via Tailscale e `TAILSCALE_MODEL_HOST` configurado no `.
 .venv/bin/streamlit run app.py
 ```
 
-O chat mantém conversas separadas por modo somente na sessão do navegador e oferece temas claro/escuro. Em **Conversa direta**, as mensagens são enviadas ao Ollama, sem consultar documentos ou Neo4j; respostas sobre o dataset não são fundamentadas. **RAG** consulta os índices Neo4j, envia a pergunta, `doc_id`/`chunk_id` e trechos recuperados ao Ollama configurado via Tailscale e mostra as citações documentais. É necessário marcar a autorização explícita no painel; escolha o escopo documental, use apenas dados saneados e confirme a autorização para o escopo `PESSOA`. O histórico RAG é exibido, mas não é enviado como evidência ao modelo. **GraphRAG** e **KAG** continuam indisponíveis, assim como a visualização de caminhos e a persistência de conversas.
+O chat mantém conversas diretas e RAG separadas, oferece retomada/exclusão pelo painel e temas claro/escuro. As conversas são gravadas como Markdown UTF-8 criptografado com Fernet em `.tmp/conversations/`, com UUID no nome e permissões locais restritas. A interface expurga conversas cuja última atividade passou de 30 dias sempre que executa; se o aplicativo estiver fechado, o expurgo ocorre na próxima execução. A chave fica em `RH_CONVERSATION_ENCRYPTION_KEY` no `.env`, que não deve ser compartilhado nem versionado. A criptografia protege os arquivos sem a chave, mas não contra alguém com acesso à conta local e ao `.env`. Se a chave não estiver configurada, o aplicativo informa que a persistência está indisponível e mantém o chat apenas na sessão atual.
+
+Em **Conversa direta**, as mensagens são enviadas ao Ollama, sem consultar documentos ou Neo4j; respostas sobre o dataset não são fundamentadas. **RAG** consulta os índices Neo4j, envia a pergunta, `doc_id`/`chunk_id` e trechos recuperados ao Ollama configurado via Tailscale e mostra as citações documentais. É necessário marcar a autorização explícita no painel; escolha o escopo documental, use apenas dados saneados e confirme a autorização para o escopo `PESSOA`. O histórico RAG é exibido, mas não é enviado como evidência ao modelo. **GraphRAG** e **KAG** continuam indisponíveis, assim como a visualização de caminhos.
 
 O acesso ao Neo4j está encapsulado em `src/database/neo4j.py`, com transações de leitura/escrita e parâmetros Cypher separados da consulta. A geração em `src/generation/llm.py` usa a API nativa de chat do Ollama no host indicado por `TAILSCALE_MODEL_HOST` (URL ou host/porta, normalmente com a porta padrão do Ollama). Se houver exatamente um modelo instalado, ele é selecionado automaticamente. Com mais de um modelo, informe `model_name` ao criar `OllamaClient`.
 
@@ -369,7 +377,7 @@ Esta é uma estrutura-alvo, não uma afirmação de que todos os diretórios já
 
 ## 12. Critérios mínimos de aceite
 
-- [x] Schema Neo4j executa sem erros e constraints/índices são verificados.
+- [ ] Schema versionado executado sem erros; constraints e índices validados no Neo4j.
 - [x] Nós e relações do dataset são carregados com IDs canônicos.
 - [x] Datas e propriedades temporais dos vínculos foram validadas e importadas.
 - [x] Documentos são associados a chunks com referência ao arquivo de origem.

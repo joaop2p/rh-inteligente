@@ -12,6 +12,12 @@ from src.generation.llm import (
     LLMRequestError,
     OllamaClient,
 )
+from src.persistence.conversations import (
+    Conversation,
+    ConversationStore,
+    ConversationStoreError,
+    StoredSource,
+)
 from src.rag.pipeline import RAGPipeline, RAGResponse, RAGResponseError
 from src.retrieval.vector_search import (
     EmbeddingModel,
@@ -63,6 +69,31 @@ def answer_with_rag(question: str, document_scope: str | None) -> RAGResponse:
         return RAGPipeline(search, OllamaClient.from_env()).answer(
             question,
             document_scope=document_scope,
+        )
+
+
+def restore_conversation(mode: str, saved: Conversation) -> None:
+    message_key = "messages" if mode == "direct" else "rag_messages"
+    restored = [
+        {"role": message.role, "content": message.content}
+        for message in saved.messages
+        if message.mode == mode
+    ]
+    st.session_state[message_key] = restored
+    if mode == "RAG":
+        latest_answer = next(
+            (
+                message
+                for message in reversed(saved.messages)
+                if message.mode == "RAG" and message.role == "assistant"
+            ),
+            None,
+        )
+        st.session_state.rag_sources = (
+            list(latest_answer.sources) if latest_answer is not None else []
+        )
+        st.session_state.rag_status = (
+            latest_answer.status if latest_answer is not None else None
         )
 
 
@@ -125,12 +156,25 @@ def main() -> None:
     st.set_page_config(page_title="RH Inteligente", page_icon="💬", layout="wide")
     if "messages" not in st.session_state:
         st.session_state.messages = []
+    if "direct_conversation_id" not in st.session_state:
+        st.session_state.direct_conversation_id = None
     if "rag_messages" not in st.session_state:
         st.session_state.rag_messages = []
+    if "rag_conversation_id" not in st.session_state:
+        st.session_state.rag_conversation_id = None
     if "rag_sources" not in st.session_state:
         st.session_state.rag_sources = []
     if "rag_status" not in st.session_state:
         st.session_state.rag_status = None
+
+    store: ConversationStore | None = None
+    store_error: str | None = None
+    try:
+        store = ConversationStore.from_env()
+        store.purge_expired()
+    except (ConversationStoreError, OSError) as exc:
+        store = None
+        store_error = str(exc)
 
     with st.sidebar:
         st.markdown("### ◈ RH Inteligente")
@@ -167,14 +211,124 @@ def main() -> None:
                 "Entendi e autorizo o envio da pergunta, IDs e trechos recuperados.",
                 key="rag_remote_consent",
             )
+        history_mode = (
+            "direct" if mode == "Conversa direta" else "RAG" if mode == "RAG" else None
+        )
+        id_key: str | None = None
+        message_key: str | None = None
+        if history_mode is not None:
+            id_key = (
+                "direct_conversation_id"
+                if history_mode == "direct"
+                else "rag_conversation_id"
+            )
+            message_key = "messages" if history_mode == "direct" else "rag_messages"
+            history_key = f"history_selection_{history_mode}"
+            if store is not None:
+                try:
+                    saved_conversations = store.list_conversations()
+                except (ConversationStoreError, OSError) as exc:
+                    store = None
+                    store_error = str(exc)
+                    saved_conversations = []
+            else:
+                saved_conversations = []
+
+            mode_conversations = [
+                saved
+                for saved in saved_conversations
+                if any(message.mode == history_mode for message in saved.messages)
+            ]
+            if st.session_state[id_key] is None:
+                latest = mode_conversations[0] if mode_conversations else None
+                st.session_state[id_key] = (
+                    latest.conversation_id if latest is not None else ""
+                )
+                if latest is not None:
+                    restore_conversation(history_mode, latest)
+            options = [""] + [saved.conversation_id for saved in mode_conversations]
+            if st.session_state[id_key] not in options:
+                st.session_state[id_key] = ""
+                st.session_state[message_key] = []
+                if history_mode == "RAG":
+                    st.session_state.rag_sources = []
+                    st.session_state.rag_status = None
+            if store is not None:
+                reset_requested = st.session_state.pop(
+                    f"new_conversation_requested_{history_mode}", False
+                )
+                selection_sync_requested = st.session_state.pop(
+                    f"history_selection_sync_{history_mode}", False
+                )
+                if reset_requested or selection_sync_requested:
+                    st.session_state[history_key] = st.session_state[id_key]
+                if st.session_state.get(history_key) not in options:
+                    st.session_state[history_key] = st.session_state[id_key]
+                labels = {
+                    saved.conversation_id: (
+                        f"{saved.title} · "
+                        f"{saved.updated_at.astimezone().strftime('%d/%m %H:%M')}"
+                    )
+                    for saved in mode_conversations
+                }
+                selected_id = st.selectbox(
+                    "Conversas salvas",
+                    options,
+                    key=history_key,
+                    format_func=lambda value: labels.get(value, "Nova conversa"),
+                )
+                if selected_id != st.session_state[id_key]:
+                    st.session_state[id_key] = selected_id
+                    if selected_id:
+                        selected_conversation = next(
+                            saved
+                            for saved in mode_conversations
+                            if saved.conversation_id == selected_id
+                        )
+                        restore_conversation(history_mode, selected_conversation)
+                    else:
+                        st.session_state[message_key] = []
+                        if history_mode == "RAG":
+                            st.session_state.rag_sources = []
+                            st.session_state.rag_status = None
+            elif store_error:
+                st.warning(
+                    "Persistência local indisponível. Esta conversa ficará "
+                    f"somente nesta sessão: {store_error}"
+                )
         theme = st.radio("Tema", ("Claro", "Escuro"), horizontal=True)
         st.divider()
         if st.button("Nova conversa", use_container_width=True):
-            st.session_state.messages = []
-            st.session_state.rag_messages = []
-            st.session_state.rag_sources = []
-            st.session_state.rag_status = None
+            if history_mode == "direct":
+                st.session_state.direct_conversation_id = ""
+                st.session_state.messages = []
+            elif history_mode == "RAG":
+                st.session_state.rag_conversation_id = ""
+                st.session_state.rag_messages = []
+                st.session_state.rag_sources = []
+                st.session_state.rag_status = None
+            if history_mode is not None:
+                st.session_state[f"new_conversation_requested_{history_mode}"] = True
             st.rerun()
+        if (
+            history_mode is not None
+            and store is not None
+            and id_key is not None
+            and message_key is not None
+            and st.session_state[id_key]
+            and st.button("Excluir conversa atual", use_container_width=True)
+        ):
+            try:
+                store.delete_conversation(st.session_state[id_key])
+            except (ConversationStoreError, OSError) as exc:
+                st.error(f"Não foi possível excluir a conversa: {exc}")
+            else:
+                st.session_state[id_key] = ""
+                st.session_state[message_key] = []
+                if history_mode == "RAG":
+                    st.session_state.rag_sources = []
+                    st.session_state.rag_status = None
+                st.rerun()
         st.caption("Não envie dados pessoais ou informações sensíveis.")
 
     apply_theme(theme)
@@ -247,6 +401,24 @@ def main() -> None:
                             "role": "assistant",
                             "content": answer,
                         }
+                        if store is not None:
+                            try:
+                                saved = store.save_exchange(
+                                    st.session_state.direct_conversation_id or None,
+                                    "direct",
+                                    prompt,
+                                    answer,
+                                )
+                            except (ConversationStoreError, OSError) as exc:
+                                st.error(
+                                    "A resposta foi recebida, mas não foi possível "
+                                    f"salvar a conversa: {exc}"
+                                )
+                            else:
+                                st.session_state.direct_conversation_id = (
+                                    saved.conversation_id
+                                )
+                                st.session_state.history_selection_sync_direct = True
                         st.session_state.messages.extend(
                             [user_message, assistant_message]
                         )
@@ -273,6 +445,36 @@ def main() -> None:
                             "role": "assistant",
                             "content": response.answer,
                         }
+                        if store is not None:
+                            try:
+                                saved = store.save_exchange(
+                                    st.session_state.rag_conversation_id or None,
+                                    "RAG",
+                                    prompt,
+                                    response.answer,
+                                    sources=tuple(
+                                        StoredSource(
+                                            doc_id=source.doc_id,
+                                            chunk_id=source.chunk_id,
+                                            quote=source.quote,
+                                            vector_score=source.vector_score,
+                                            fulltext_score=source.fulltext_score,
+                                            rank_score=source.rank_score,
+                                        )
+                                        for source in response.sources
+                                    ),
+                                    status=response.status,
+                                )
+                            except (ConversationStoreError, OSError) as exc:
+                                st.error(
+                                    "A resposta foi recebida, mas não foi possível "
+                                    f"salvar a conversa: {exc}"
+                                )
+                            else:
+                                st.session_state.rag_conversation_id = (
+                                    saved.conversation_id
+                                )
+                                st.session_state.history_selection_sync_RAG = True
                         st.session_state.rag_messages.extend(
                             [user_message, assistant_message]
                         )
