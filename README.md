@@ -2,7 +2,7 @@
 
 Aplicação monolítica em Python e Streamlit para consultas de Recursos Humanos, com Neo4j como base de conhecimento em modelo LPG (*Labeled Property Graph*) e previsão de fluxos **RAG, GraphRAG e KAG**.
 
-> **Estado do projeto:** os scripts de ingestão do cadastro mestre, relações, metadados documentais, chunks e embeddings foram executados no Neo4j. A interface Streamlit permite testar conversas diretas com o LLM; os fluxos de recuperação RAG/GraphRAG/KAG ainda não estão implementados.
+> **Estado do projeto:** os scripts de ingestão do cadastro mestre, relações, metadados documentais, chunks e embeddings foram executados no Neo4j. A busca vetorial inicial de chunks está implementada em `src/retrieval/vector_search.py`, mas ainda não está integrada ao fluxo RAG de ponta a ponta nem ao Streamlit. GraphRAG e KAG ainda não estão implementados.
 
 ## 1. Objetivo
 
@@ -203,7 +203,7 @@ Para preparar uma instalação nova:
 6. Executar `neo4j/00_schema.cypher` no Neo4j Browser.
 7. Validar constraints e índices com `SHOW CONSTRAINTS;` e `SHOW INDEXES;`.
 
-No banco usado na ingestão descrita neste README, os dados mestres, relações, metadados documentais, chunks e embeddings já foram carregados. O índice vetorial `chunk_embedding` foi verificado como `ONLINE`; o script completo de schema ainda não foi executado/verificado nesse banco. Os fluxos de recuperação RAG/GraphRAG/KAG ainda precisam ser implementados.
+No banco usado na ingestão descrita neste README, os dados mestres, relações, metadados documentais, chunks e embeddings já foram carregados. O índice vetorial `chunk_embedding` foi verificado como `ONLINE`; o script completo de schema ainda não foi executado/verificado nesse banco. A busca vetorial inicial está implementada, mas a integração de ponta a ponta com RAG/Ollama/Streamlit, GraphRAG e KAG ainda precisa ser feita.
 
 ### Executar a interface
 
@@ -216,6 +216,27 @@ Com o Ollama acessível via Tailscale e `TAILSCALE_MODEL_HOST` configurado no `.
 O chat mantém a conversa na sessão do navegador e oferece temas claro/escuro. Em **Conversa direta**, as mensagens são enviadas ao Ollama, sem consultar documentos ou Neo4j; respostas sobre o dataset não são fundamentadas. Os modos **RAG**, **GraphRAG** e **KAG**, as referências e a visualização de caminho são espaços reservados e não executam buscas. Não envie dados pessoais ou sensíveis durante este teste.
 
 O acesso ao Neo4j está encapsulado em `src/database/neo4j.py`, com transações de leitura/escrita e parâmetros Cypher separados da consulta. A geração em `src/generation/llm.py` usa a API nativa de chat do Ollama no host indicado por `TAILSCALE_MODEL_HOST` (URL ou host/porta, normalmente com a porta padrão do Ollama). Se houver exatamente um modelo instalado, ele é selecionado automaticamente. Com mais de um modelo, informe `model_name` ao criar `OllamaClient`.
+
+### Recuperação vetorial inicial
+
+`src/retrieval/vector_search.py` implementa uma busca inicial de chunks pelo índice Neo4j `chunk_embedding`. `VectorSearch` recebe uma conexão `Neo4jDatabase` e um modelo de embeddings, gera o vetor da pergunta com `BAAI/bge-m3` (1024 dimensões, normalizado) e retorna até cinco resultados tipados com `doc_id`, `chunk_id`, texto e score. O valor de `top_k` pode ser ajustado por chamada; embeddings com dimensão ou valores inválidos e resultados sem proveniência são rejeitados.
+
+Exemplo de uso:
+
+```python
+from src.database.neo4j import Neo4jDatabase
+from src.retrieval.vector_search import VectorSearch, load_embedding_model
+
+with Neo4jDatabase.from_env() as graph:
+    chunks = VectorSearch(graph, load_embedding_model()).search(
+        "Quais são as condições de férias?",
+        top_k=5,
+    )
+    for chunk in chunks:
+        print(chunk.doc_id, chunk.chunk_id, chunk.score, chunk.texto)
+```
+
+Esse componente recupera evidências, mas ainda não chama o Ollama, não aplica limiar de relevância e não está conectado ao Streamlit. Uma busca vetorial sozinha não é GraphRAG; o fluxo híbrido, a construção KAG e respostas com declaração de insuficiência ainda estão pendentes.
 
 Exemplo de uso:
 
