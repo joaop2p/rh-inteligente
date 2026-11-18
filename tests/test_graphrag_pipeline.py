@@ -7,6 +7,7 @@ from typing import Any, Literal, Sequence
 import pytest
 
 from src.generation.llm import ChatMessage
+from src.rag.kag_pipeline import KAGPipeline
 from src.rag.graphrag_pipeline import (
     GraphRAGPipeline,
     GraphRAGResponseError,
@@ -170,6 +171,45 @@ def _reporting_path(
         for index in range(distance)
     )
     return GraphPath(people=people, relationships=relationships)
+
+
+def test_kag_answers_basic_document_questions_when_graph_intent_is_absent() -> None:
+    chunk = RetrievedChunk(
+        chunk_id="CHUNK-FERIAS",
+        doc_id="DOC-FERIAS",
+        texto="O colaborador tem direito a férias conforme a política interna.",
+        score=0.91,
+        rank_score=0.04,
+        fulltext_score=2.0,
+    )
+    search = FakeSearch([chunk])
+    graph_search = FakeGraphSearch((), _graph_result(paths=(), evidence=()))
+    llm = FakeLLM(
+        {
+            "status": "answered",
+            "answer": "A política prevê férias ao colaborador.",
+            "citations": [
+                {"doc_id": "DOC-FERIAS", "chunk_id": "CHUNK-FERIAS"}
+            ],
+        }
+    )
+
+    response = KAGPipeline(search, graph_search, llm).answer(
+        "Qual é a política de férias?",
+        as_of=date(2025, 1, 1),
+        top_k=5,
+        document_scope="ORGANIZACAO",
+    )
+
+    assert response.status == "answered"
+    assert response.sources[0].origins == ("vector",)
+    assert response.knowledge_package is not None
+    assert response.knowledge_package["document_chunks"][0]["chunk_id"] == (
+        "CHUNK-FERIAS"
+    )
+    assert search.calls == [
+        ("Qual é a política de férias?", 5, "ORGANIZACAO", None)
+    ]
 
 
 def test_pipeline_fuses_graph_and_vector_chunks_and_validates_citations() -> None:

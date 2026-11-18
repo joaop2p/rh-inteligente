@@ -92,6 +92,7 @@ class RAGPipeline:
         llm: ChatModel,
         *,
         min_vector_score: float | None = RAG_MIN_VECTOR_SCORE,
+        system_message: ChatMessage = RAG_SYSTEM_MESSAGE,
     ) -> None:
         if min_vector_score is not None and (
             isinstance(min_vector_score, bool)
@@ -102,6 +103,7 @@ class RAGPipeline:
         self._search = search
         self._llm = llm
         self._min_vector_score = min_vector_score
+        self._system_message = system_message
 
     def answer(
         self,
@@ -148,7 +150,7 @@ class RAGPipeline:
         )
         raw_response = self._llm.chat(
             [
-                RAG_SYSTEM_MESSAGE,
+                self._system_message,
                 {"role": "user", "content": user_content},
             ],
             temperature=0.0,

@@ -8,8 +8,10 @@ from src.rag.graphrag_pipeline import (
     GraphRAGPipeline,
     GraphRAGResponse,
     GraphRAGResponseError,
+    GraphRAGSource,
 )
 from src.generation.llm import ChatMessage
+from src.rag.pipeline import RAGPipeline
 
 
 KAG_SYSTEM_MESSAGE: ChatMessage = {
@@ -38,6 +40,11 @@ class KAGPipeline:
             llm,
             system_message=KAG_SYSTEM_MESSAGE,
         )
+        self._rag_pipeline = RAGPipeline(
+            search,
+            llm,
+            system_message=KAG_SYSTEM_MESSAGE,
+        )
 
     def answer(
         self,
@@ -53,6 +60,46 @@ class KAGPipeline:
             top_k=top_k,
             document_scope=document_scope,
         )
+        if response.status == "insufficient":
+            rag_response = self._rag_pipeline.answer(
+                question,
+                top_k=top_k,
+                document_scope=document_scope,
+            )
+            sources = [
+                GraphRAGSource(
+                    doc_id=source.doc_id,
+                    chunk_id=source.chunk_id,
+                    text=source.text,
+                    origins=("vector",),
+                    vector_score=source.vector_score,
+                    fulltext_score=source.fulltext_score,
+                    rank_score=source.rank_score,
+                )
+                for source in rag_response.sources
+            ]
+            response = GraphRAGResponse(
+                answer=rag_response.answer,
+                sources=sources,
+                paths=response.paths,
+                status=rag_response.status,
+                cypher=response.cypher,
+                as_of=as_of,
+                knowledge_package={
+                    "as_of": as_of.isoformat(),
+                    "facts": [],
+                    "relationships": [],
+                    "document_chunks": [
+                        {
+                            "doc_id": source.doc_id,
+                            "chunk_id": source.chunk_id,
+                            "text": source.text,
+                            "origins": ["vector"],
+                        }
+                        for source in sources
+                    ],
+                },
+            )
         if response.knowledge_package is None:
             raise GraphRAGResponseError(
                 "O pacote KAG não foi construído a partir das evidências recuperadas."

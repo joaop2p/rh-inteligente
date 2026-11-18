@@ -616,7 +616,7 @@ def main() -> None:
                         except (LLMConfigurationError, LLMRequestError) as exc:
                             st.error(f"Não foi possível obter uma resposta: {exc}")
                             answer = ""
-                    if "answer" in locals() and answer:
+                    if "answer" in locals() and answer: # type: ignore
                         assistant_message: ChatMessage = {
                             "role": "assistant",
                             "content": answer,
