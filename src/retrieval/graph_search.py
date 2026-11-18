@@ -78,9 +78,12 @@ WITH
     nodes(path) AS path_nodes,
     relationships(path) AS path_relationships
 UNWIND path_nodes AS path_person
+OPTIONAL MATCH (document:Documento)-[:TEM_TRECHO]->(chunk:Chunk)
 OPTIONAL MATCH
-    (document:Documento)-[:TEM_TRECHO]->(chunk:Chunk)-[:MENCIONA]->(path_person)
-WHERE $document_scope IS NULL OR document.escopo = $document_scope
+    (document)-[:REFERE_SE_A|ASSINADO_POR|ENVOLVE]->(path_person)
+WHERE
+    chunk IS NOT NULL
+    AND ($document_scope IS NULL OR document.escopo = $document_scope)
 WITH
     path,
     path_nodes,

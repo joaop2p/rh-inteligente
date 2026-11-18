@@ -2,7 +2,7 @@
 
 Aplicação monolítica em Python e Streamlit para consultas de Recursos Humanos, com Neo4j como base de conhecimento em modelo LPG (*Labeled Property Graph*) e previsão de fluxos **RAG, GraphRAG e KAG**.
 
-> **Estado do projeto:** os scripts de ingestão do cadastro mestre, relações, metadados documentais, chunks e embeddings foram executados no Neo4j. A recuperação híbrida e o pipeline RAG com proveniência estão conectados ao modo RAG do Streamlit. Um GraphRAG limitado a perguntas hierárquicas com pessoa canônica explícita ou cargo CEO canônico combina travessia temporal, busca vetorial/full-text e chunks com proveniência. Há também um baseline Text-to-Graph determinístico. Conversas diretas e RAG podem ser salvas localmente em arquivos Markdown criptografados; KAG, visualização interativa do subgrafo e validação live do novo fluxo GraphRAG continuam pendentes.
+> **Estado do projeto:** os scripts de ingestão do cadastro mestre, relações, metadados documentais, chunks e embeddings foram executados no Neo4j. A recuperação híbrida e os pipelines RAG e GraphRAG com proveniência estão conectados à interface. O KAG foi habilitado como um pacote explícito de fatos, relações temporais, caminhos e chunks antes da geração. Conversas diretas, RAG e consultas KAG podem ser salvas localmente em arquivos Markdown criptografados. Conversa direta pode habilitar opcionalmente a consulta ao banco por KAG após consentimento.
 
 ## 1. Objetivo
 
@@ -221,7 +221,7 @@ Com o Ollama acessível via Tailscale e `TAILSCALE_MODEL_HOST` configurado no `.
 
 O chat mantém conversas diretas e RAG separadas, oferece retomada/exclusão pelo painel e temas claro/escuro. As conversas são gravadas como Markdown UTF-8 criptografado com Fernet em `.tmp/conversations/`, com UUID no nome e permissões locais restritas. A interface expurga conversas cuja última atividade passou de 30 dias sempre que executa; se o aplicativo estiver fechado, o expurgo ocorre na próxima execução. A chave fica em `RH_CONVERSATION_ENCRYPTION_KEY` no `.env`, que não deve ser compartilhado nem versionado. A criptografia protege os arquivos sem a chave, mas não contra alguém com acesso à conta local e ao `.env`. Se a chave não estiver configurada, o aplicativo informa que a persistência está indisponível e mantém o chat apenas na sessão atual.
 
-Em **Conversa direta**, as mensagens são enviadas ao Ollama, sem consultar documentos ou Neo4j; respostas sobre o dataset não são fundamentadas. **RAG** consulta os índices Neo4j e mostra as citações documentais. **GraphRAG** atende somente perguntas hierárquicas suportadas, combina caminho temporal com chunks recuperados e exibe evidências; ambos enviam pergunta, IDs e trechos ao Ollama via Tailscale após consentimento explícito. Use dados saneados e confirme autorização, especialmente no escopo `PESSOA`. O histórico GraphRAG não é persistido. **KAG** e visualização interativa do subgrafo continuam indisponíveis.
+Em **Conversa direta**, as mensagens são enviadas ao Ollama sem consultar o banco por padrão; a opção explícita "Consultar o banco Neo4j nesta conversa" ativa o fluxo KAG após consentimento. **RAG** consulta os índices Neo4j e mostra as citações documentais. **GraphRAG** atende perguntas hierárquicas suportadas e combina caminho temporal com chunks. **KAG** monta um pacote rastreável com fatos, relações temporais, caminhos e chunks antes da geração. RAG, GraphRAG e KAG enviam dados externos ao Ollama via Tailscale somente após consentimento explícito. Use dados saneados e confirme autorização, especialmente no escopo `PESSOA`. O histórico GraphRAG/KAG não é persistido separadamente; visualização interativa do subgrafo continua pendente.
 
 O acesso ao Neo4j está encapsulado em `src/database/neo4j.py`, com transações de leitura/escrita e parâmetros Cypher separados da consulta. A geração em `src/generation/llm.py` usa a API nativa de chat do Ollama no host indicado por `TAILSCALE_MODEL_HOST` (URL ou host/porta, normalmente com a porta padrão do Ollama). Se houver exatamente um modelo instalado, ele é selecionado automaticamente. Com mais de um modelo, informe `model_name` ao criar `OllamaClient`.
 
@@ -267,7 +267,7 @@ with Neo4jDatabase.from_env() as graph:
 
 O modo GraphRAG da interface combina esse caminho com resultados vetoriais/full-text e chunks `MENCIONA`, deduplicados por `doc_id`/`chunk_id`. A busca de chunks no grafo e nos índices respeita o mesmo escopo documental escolhido (`Documento.escopo`). A resposta cita somente chunks recuperados; o caminho, IDs e direção das relações temporais e referências de origem ficam expostos ao lado da resposta. O modo aceita perguntas hierárquicas contendo exatamente um nome canônico completo ou o cargo CEO com uma atribuição temporal única para `CEO`/`Chief Executive Officer`, vinculada à organização `ORG-001` por `EMPREGADO_DE`; cargos ausentes ou ambíguos resultam em insuficiência sem chamada ao LLM. Para pedidos pelos três subordinados mais próximos, retorna no máximo três pessoas com menor distância em `REPORTS_TO`, desempata pelo nome sem distinção entre maiúsculas/minúsculas e pelo ID canônico. A referência temporal usa a data atual, sem seletor na interface. A consulta é Cypher fixa/parametrizada, nunca gerada pelo modelo.
 
-Esse fluxo é limitado ao caso hierárquico e ainda não foi executado contra Neo4j real. A conversa GraphRAG permanece apenas na sessão atual, sem persistência no armazenamento criptografado. KAG, algoritmos como PageRank/Leiden, visualização interativa do subgrafo, aliases e NER/RE semântico continuam pendentes.
+Esse fluxo é limitado ao caso hierárquico suportado por `REPORTS_TO`, com consultas Cypher parametrizadas e allowlisted. A conversa GraphRAG/KAG permanece apenas na sessão atual, sem persistência no armazenamento criptografado. O pacote KAG expõe fatos, relações temporais, caminho, `doc_id`/`chunk_id` e consulta usada. PageRank/Leiden, visualização interativa do subgrafo, aliases e NER/RE semântico permanecem pendentes.
 
 ### Recuperação híbrida inicial e pipeline RAG
 
@@ -304,7 +304,7 @@ with Neo4jDatabase.from_env() as graph:
 
 `src/rag/pipeline.py` usa os resultados como candidatos documentais e solicita ao Ollama JSON com status, resposta e citações. Se o filtro configurado não deixar chunks, o pipeline retorna insuficiência sem chamar o LLM. A instrução restringe o modelo a RH da NovaTech e às evidências daquela pergunta; o histórico de conversa não é enviado como prova. Respostas citadas são aceitas somente se os pares `doc_id`/`chunk_id` existirem entre os trechos recuperados. `RAGSource.text` é o texto completo do chunk citado, não uma frase extraída ou validada como citação literal. Sem resultados, o LLM não é chamado; se o modelo marcar insuficiência, o pipeline retorna a mensagem fixa sem fontes.
 
-Isso não garante, por si só, a validade semântica da resposta: o modelo ainda pode classificar incorretamente um trecho como suficiente. A qualidade da relevância e a insuficiência semântica ainda precisam de avaliação mais abrangente. O fluxo GraphRAG atual cobre somente a hierarquia por `REPORTS_TO`; outras consultas estruturadas, KAG, algoritmos de grafo e visualização interativa continuam pendentes.
+Isso não garante, por si só, a validade semântica da resposta: o modelo ainda pode classificar incorretamente um trecho como suficiente. A qualidade da relevância e a insuficiência semântica ainda precisam de avaliação mais abrangente. O fluxo GraphRAG/KAG atual cobre somente a hierarquia por `REPORTS_TO`; outras consultas estruturadas, algoritmos de grafo e visualização interativa continuam pendentes.
 
 Para testar a busca contra o Neo4j configurado e o modelo BGE-M3 real, com os dados saneados já carregados:
 
@@ -432,7 +432,7 @@ Esta é uma estrutura-alvo, não uma afirmação de que todos os diretórios já
 - [ ] RAG recupera trechos relevantes e cita suas fontes.
 - [ ] GraphRAG executa Cypher e demonstra ao menos uma travessia multi-hop.
 - [ ] Recuperação híbrida combina e deduplica resultados vetoriais e do grafo.
-- [ ] KAG fornece ao LLM fatos, relações, datas e evidências rastreáveis.
+- [x] KAG fornece ao LLM fatos, relações, datas e evidências rastreáveis.
 - [ ] Aplicação exibe fontes, nós, arestas, Cypher e métricas disponíveis.
 - [ ] Quando não há evidência, o sistema declara a insuficiência em vez de fabricar resposta.
 - [ ] Testes cobrem casos positivos, ausência de evidência e relações temporais.

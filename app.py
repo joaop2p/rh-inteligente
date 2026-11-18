@@ -26,6 +26,7 @@ from src.rag.graphrag_pipeline import (
     GraphRAGResponse,
     GraphRAGResponseError,
 )
+from src.rag.kag_pipeline import KAGPipeline
 from src.rag.pipeline import RAGPipeline, RAGResponse, RAGResponseError
 from src.retrieval.graph_search import GraphSearch, GraphSearchError
 from src.retrieval.vector_search import (
@@ -146,6 +147,42 @@ def answer_with_graphrag(
         return response
 
 
+def answer_with_kag(
+    question: str,
+    document_scope: str | None,
+    as_of: date,
+) -> GraphRAGResponse:
+    """Executa o mesmo núcleo seguro do GraphRAG e retorna seu pacote KAG."""
+    with Neo4jDatabase.from_env() as database:
+        database.verify_connectivity()
+        embedding_model = _cached_embedding_model()
+        llm = OllamaClient.from_env()
+        graph_search = GraphSearch(database)
+        search_clause = SearchClauseVectorSearch(database, embedding_model)
+        try:
+            response = KAGPipeline(
+                search_clause, graph_search, llm
+            ).answer(
+                question,
+                document_scope=document_scope,
+                as_of=as_of,
+            )
+        except CypherSyntaxError as exc:
+            LOGGER.warning(
+                "SEARCH do Neo4j indisponível (%s); usando as procedures clássicas.",
+                type(exc).__name__,
+            )
+            search_procedures = VectorSearch(database, embedding_model)
+            response = KAGPipeline(
+                search_procedures, graph_search, llm
+            ).answer(
+                question,
+                document_scope=document_scope,
+                as_of=as_of,
+            )
+        return response
+
+
 def restore_conversation(mode: str, saved: Conversation) -> None:
     message_key = "messages" if mode == "direct" else "rag_messages"
     restored = [
@@ -252,6 +289,8 @@ def main() -> None:
         st.session_state.graphrag_status = None
     if "graphrag_result_as_of" not in st.session_state:
         st.session_state.graphrag_result_as_of = None
+    if "direct_database_consultation" not in st.session_state:
+        st.session_state.direct_database_consultation = False
 
     store: ConversationStore | None = None
     store_error: str | None = None
@@ -271,12 +310,12 @@ def main() -> None:
         mode = st.selectbox(
             "Modo de busca",
             ("Conversa direta", "RAG", "GraphRAG", "KAG"),
-            help="RAG está disponível. GraphRAG cobre consultas hierárquicas com pessoa ou cargo CEO canônico.",
+            help="RAG consulta documentos; GraphRAG e KAG combinam grafo hierárquico e documentos.",
             filter_mode=None,
         )
         document_scope: str | None = "ORGANIZACAO"
         rag_authorized = False
-        if mode in {"RAG", "GraphRAG"}:
+        if mode in {"RAG", "GraphRAG", "KAG"}:
             scope_options = {
                 "Somente organização": "ORGANIZACAO",
                 "Somente pessoas": "PESSOA",
@@ -294,7 +333,7 @@ def main() -> None:
                     "ao Ollama via Tailscale. Use somente dados saneados; no escopo "
                     "PESSOA, confirme que o envio está autorizado."
                 )
-            else:
+            elif mode == "GraphRAG":
                 st.warning(
                     "GraphRAG envia a pergunta, caminho hierárquico e chunks "
                     "recuperados ao Ollama via Tailscale. A busca atual exige "
@@ -305,10 +344,33 @@ def main() -> None:
                 st.caption(
                     "O histórico GraphRAG não é persistido e fica somente nesta sessão."
                 )
+            else:
+                st.warning(
+                    "KAG monta fatos, relações temporais, caminhos e chunks antes "
+                    "de enviar um pacote de conhecimento ao Ollama. Use somente "
+                    "dados saneados e autorize explicitamente o envio."
+                )
             rag_authorized = st.checkbox(
                 "Entendi e autorizo o envio da pergunta, IDs, caminho e trechos recuperados.",
                 key="remote_evidence_consent",
             )
+        if mode == "Conversa direta":
+            st.checkbox(
+                "Consultar o banco Neo4j nesta conversa",
+                key="direct_database_consultation",
+                help="Usa o fluxo KAG parametrizado para perguntas hierárquicas.",
+            )
+            if st.session_state.direct_database_consultation:
+                st.warning(
+                    "A consulta envia pergunta, IDs, relações temporais e chunks "
+                    "ao Ollama via Tailscale. Autorize o envio explicitamente."
+                )
+                rag_authorized = st.checkbox(
+                    "Entendi e autorizo o envio das evidências recuperadas.",
+                    key="direct_database_consent",
+                )
+            else:
+                rag_authorized = True
         history_mode = (
             "direct" if mode == "Conversa direta" else "RAG" if mode == "RAG" else None
         )
@@ -443,10 +505,16 @@ def main() -> None:
         st.title("Converse com a IA")
         st.caption("Assistente de conhecimento de RH da NovaTech.")
         if mode == "Conversa direta":
-            st.info(
-                "Conversa de teste: sem consulta ao Neo4j ou aos documentos. "
-                "As respostas não são fundamentadas no dataset."
-            )
+            if st.session_state.direct_database_consultation:
+                st.info(
+                    "Conversa direta com KAG: a resposta usa exclusivamente fatos, "
+                    "relações temporais e chunks recuperados do Neo4j."
+                )
+            else:
+                st.info(
+                    "Conversa de teste: sem consulta ao Neo4j ou aos documentos. "
+                    "As respostas não são fundamentadas no dataset."
+                )
             visible_messages = st.session_state.messages
         elif mode == "RAG":
             st.info(
@@ -461,10 +529,11 @@ def main() -> None:
             )
             visible_messages = st.session_state.graphrag_messages
         else:
-            st.warning(
-                f"{mode} ainda não está disponível; nenhuma busca será executada."
+            st.info(
+                "KAG constrói um pacote explícito de fatos, relações temporais "
+                "e trechos documentais antes da geração."
             )
-            visible_messages = []
+            visible_messages = st.session_state.graphrag_messages
 
         history = st.container(height=400, border=False)
         with history:
@@ -489,8 +558,14 @@ def main() -> None:
         prompt = st.chat_input(
             "Escreva sua mensagem",
             disabled=(
-                mode == "KAG"
-                or (mode in {"RAG", "GraphRAG"} and not rag_authorized)
+                (
+                    mode in {"RAG", "GraphRAG", "KAG"}
+                    or (
+                        mode == "Conversa direta"
+                        and st.session_state.direct_database_consultation
+                    )
+                )
+                and not rag_authorized
             ),
         )
         if prompt:
@@ -500,19 +575,48 @@ def main() -> None:
                 with st.chat_message("user"):
                     st.markdown(prompt)
                 if mode == "Conversa direta":
-                    try:
-                        with st.spinner("Aguardando resposta do modelo..."):
-                            client = OllamaClient.from_env()
-                            answer = client.chat(
-                                [
-                                    SYSTEM_MESSAGE,
-                                    *st.session_state.messages,
-                                    user_message,
-                                ]
-                            )
-                    except (LLMConfigurationError, LLMRequestError) as exc:
-                        st.error(f"Não foi possível obter uma resposta: {exc}")
+                    if st.session_state.direct_database_consultation:
+                        try:
+                            with st.spinner(
+                                "Consultando KAG no Neo4j e preparando evidências..."
+                            ):
+                                response = answer_with_kag(
+                                    prompt,
+                                    document_scope="ORGANIZACAO",
+                                    as_of=date.today(),
+                                )
+                        except (LLMConfigurationError, LLMRequestError) as exc:
+                            st.error(f"Não foi possível consultar o Ollama: {exc}")
+                        except Neo4jConfigurationError as exc:
+                            st.error(f"Não foi possível configurar o Neo4j: {exc}")
+                        except Neo4jError as exc:
+                            st.error(f"Falha ao consultar o Neo4j: {exc}")
+                        except GraphSearchError as exc:
+                            st.error(f"Falha ao resolver ou percorrer o grafo: {exc}")
+                        except GraphRAGResponseError as exc:
+                            st.error(f"A resposta do KAG foi inválida: {exc}")
+                        else:
+                            answer = response.answer
+                            st.session_state.graphrag_sources = response.sources
+                            st.session_state.graphrag_paths = response.paths
+                            st.session_state.graphrag_cypher = response.cypher
+                            st.session_state.graphrag_status = response.status
+                            st.session_state.graphrag_result_as_of = response.as_of
                     else:
+                        try:
+                            with st.spinner("Aguardando resposta do modelo..."):
+                                client = OllamaClient.from_env()
+                                answer = client.chat(
+                                    [
+                                        SYSTEM_MESSAGE,
+                                        *st.session_state.messages,
+                                        user_message,
+                                    ]
+                                )
+                        except (LLMConfigurationError, LLMRequestError) as exc:
+                            st.error(f"Não foi possível obter uma resposta: {exc}")
+                            answer = ""
+                    if "answer" in locals() and answer:
                         assistant_message: ChatMessage = {
                             "role": "assistant",
                             "content": answer,
@@ -640,6 +744,48 @@ def main() -> None:
                         st.session_state.graphrag_result_as_of = response.as_of
                         with st.chat_message("assistant"):
                             st.markdown(response.answer)
+                elif mode == "KAG":
+                    st.session_state.graphrag_sources = []
+                    st.session_state.graphrag_paths = []
+                    st.session_state.graphrag_cypher = ""
+                    st.session_state.graphrag_status = None
+                    st.session_state.graphrag_result_as_of = None
+                    try:
+                        with st.spinner(
+                            "Montando pacote KAG e consultando evidências..."
+                        ):
+                            response = answer_with_kag(
+                                prompt,
+                                document_scope,
+                                date.today(),
+                            )
+                    except (LLMConfigurationError, LLMRequestError) as exc:
+                        st.error(f"Não foi possível consultar o Ollama: {exc}")
+                    except Neo4jConfigurationError as exc:
+                        st.error(f"Não foi possível configurar o Neo4j: {exc}")
+                    except Neo4jError as exc:
+                        st.error(f"Falha ao consultar o Neo4j: {exc}")
+                    except GraphSearchError as exc:
+                        st.error(f"Falha ao resolver ou percorrer o grafo: {exc}")
+                    except GraphRAGResponseError as exc:
+                        st.error(f"A resposta do KAG foi inválida: {exc}")
+                    except RuntimeError as exc:
+                        st.error(f"Não foi possível executar o KAG: {exc}")
+                    else:
+                        assistant_message = {
+                            "role": "assistant",
+                            "content": response.answer,
+                        }
+                        st.session_state.graphrag_messages.extend(
+                            [user_message, assistant_message]
+                        )
+                        st.session_state.graphrag_sources = response.sources
+                        st.session_state.graphrag_paths = response.paths
+                        st.session_state.graphrag_cypher = response.cypher
+                        st.session_state.graphrag_status = response.status
+                        st.session_state.graphrag_result_as_of = response.as_of
+                        with st.chat_message("assistant"):
+                            st.markdown(response.answer)
 
     with evidence:
         st.subheader("Documentos e referências")
@@ -659,8 +805,11 @@ def main() -> None:
                 st.info("A resposta mais recente não citou fontes: evidência insuficiente.")
             else:
                 st.write("Nenhuma busca RAG foi concluída nesta conversa.")
-        elif mode == "GraphRAG":
-            st.caption("Chunks citados pela resposta GraphRAG mais recente")
+        elif mode in {"GraphRAG", "KAG"} or (
+            mode == "Conversa direta"
+            and st.session_state.direct_database_consultation
+        ):
+            st.caption("Chunks citados pela resposta KAG/GraphRAG mais recente")
             if st.session_state.graphrag_sources:
                 for source in st.session_state.graphrag_sources:
                     with st.container(border=True):
@@ -686,7 +835,13 @@ def main() -> None:
                     "Selecione RAG para consultar documentos e exibir as fontes."
                 )
         st.subheader("Caminho no grafo")
-        if mode == "GraphRAG" and st.session_state.graphrag_paths:
+        if (
+            mode in {"GraphRAG", "KAG"}
+            or (
+                mode == "Conversa direta"
+                and st.session_state.direct_database_consultation
+            )
+        ) and st.session_state.graphrag_paths:
             for path_number, path in enumerate(
                 st.session_state.graphrag_paths,
                 start=1,
@@ -735,13 +890,16 @@ def main() -> None:
                     f"Escopo explícito: {scope_label}. "
                     "Scores são sinais de recuperação, não confiança."
                 )
-            elif mode == "GraphRAG":
+            elif mode in {"GraphRAG", "KAG"} or (
+                mode == "Conversa direta"
+                and st.session_state.direct_database_consultation
+            ):
                 result_as_of = (
                     st.session_state.graphrag_result_as_of
                     or date.today()
                 )
                 st.caption(
-                    "Travessia hierárquica temporal. A data inclusiva usada "
+                    "Travessia hierárquica temporal e pacote KAG explícito. A data inclusiva usada "
                     f"foi {result_as_of.isoformat()}. "
                     "Os resultados não incluem score de confiança."
                 )
@@ -749,8 +907,8 @@ def main() -> None:
                     st.code(st.session_state.graphrag_cypher, language="cypher")
             else:
                 st.caption(
-                    "KAG e visualização interativa do subgrafo ainda não estão "
-                    "disponíveis."
+                    "RAG e KAG usam consultas de recuperação validadas. "
+                    "Nenhum Cypher é gerada pelo modelo."
                 )
 
 

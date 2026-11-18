@@ -384,14 +384,15 @@ def test_search_selector_is_not_editable_and_model_selector_is_absent() -> None:
     assert not app.text_input
 
 
-@pytest.mark.parametrize("mode", ["KAG"])
-def test_unimplemented_search_modes_do_not_enable_chat(mode: str) -> None:
+def test_kag_mode_requires_remote_consent() -> None:
     app = AppTest.from_file(APP_PATH).run()
-    app.selectbox[0].set_value(mode).run()
+    app.selectbox[0].set_value("KAG").run()
 
     assert not app.exception
     assert app.chat_input[0].disabled
-    assert any("ainda não está disponível" in warning.value for warning in app.warning)
+    assert app.checkbox[0].value is False
+
+
 
 
 def test_graphrag_mode_requires_remote_consent() -> None:

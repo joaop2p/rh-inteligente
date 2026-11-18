@@ -129,6 +129,7 @@ class GraphRAGResponse:
     status: Literal["answered", "insufficient"]
     cypher: str
     as_of: date
+    knowledge_package: dict[str, Any] | None = None
 
 
 class GraphRAGPipeline:
@@ -141,6 +142,7 @@ class GraphRAGPipeline:
         llm: ChatModel,
         *,
         min_vector_score: float | None = RAG_MIN_VECTOR_SCORE,
+        system_message: ChatMessage = GRAPHRAG_SYSTEM_MESSAGE,
     ) -> None:
         if min_vector_score is not None and (
             isinstance(min_vector_score, bool)
@@ -152,6 +154,7 @@ class GraphRAGPipeline:
         self._graph_search = graph_search
         self._llm = llm
         self._min_vector_score = min_vector_score
+        self._system_message = system_message
 
     def answer(
         self,
@@ -244,6 +247,32 @@ class GraphRAGPipeline:
 
         evidence = {
             "as_of": as_of.isoformat(),
+            "facts": [
+                {
+                    "funcionario_id": person.funcionario_id,
+                    "nome": person.nome,
+                    "relationship_type": "REPORTS_TO",
+                }
+                for path in graph_result.paths
+                for person in path.people
+            ],
+            "relationships": [
+                {
+                    "type": "REPORTS_TO",
+                    "relacao_id": relationship.relacao_id,
+                    "source_id": relationship.source_id,
+                    "target_id": relationship.target_id,
+                    "valid_from": relationship.valid_from.isoformat(),
+                    "valid_to": (
+                        relationship.valid_to.isoformat()
+                        if relationship.valid_to is not None
+                        else None
+                    ),
+                    "source_references": relationship.source_references,
+                }
+                for path in graph_result.paths
+                for relationship in path.relationships
+            ],
             "resolved_role": (
                 {
                     "cargo_canonico": list(role_occupant.cargo_canonico),
@@ -300,7 +329,7 @@ class GraphRAGPipeline:
         )
         raw_response = self._llm.chat(
             [
-                GRAPHRAG_SYSTEM_MESSAGE,
+                self._system_message,
                 {"role": "user", "content": user_content},
             ],
             temperature=0.0,
@@ -312,6 +341,7 @@ class GraphRAGPipeline:
             sources,
             graph_result,
             as_of,
+            knowledge_package=evidence,
         )
 
     @staticmethod
@@ -381,6 +411,7 @@ class GraphRAGPipeline:
         sources: list[GraphRAGSource],
         graph_result: GraphSearchResult,
         as_of: date,
+        knowledge_package: dict[str, Any] | None = None,
     ) -> GraphRAGResponse:
         status = payload.get("status")
         citations = payload.get("citations")
@@ -396,9 +427,13 @@ class GraphRAGPipeline:
                 status="insufficient",
                 cypher=graph_result.cypher,
                 as_of=as_of,
+                knowledge_package=knowledge_package,
             )
         if status != "answered":
-            raise GraphRAGResponseError("Status da resposta do modelo é inválido.")
+            raise GraphRAGResponseError(
+                "Status da resposta do modelo é inválido: "
+                + json.dumps(payload, ensure_ascii=False)
+            )
         answer = payload.get("answer")
         if not isinstance(answer, str) or not answer.strip():
             raise GraphRAGResponseError("Resposta fundamentada sem texto.")
@@ -435,6 +470,7 @@ class GraphRAGPipeline:
             status="answered",
             cypher=graph_result.cypher,
             as_of=as_of,
+            knowledge_package=knowledge_package,
         )
 
     @staticmethod
@@ -451,6 +487,12 @@ class GraphRAGPipeline:
             status="insufficient",
             cypher=cypher,
             as_of=as_of,
+            knowledge_package={
+                "as_of": as_of.isoformat(),
+                "facts": [],
+                "relationships": [],
+                "document_chunks": [],
+            },
         )
 
 def _role_titles_in_question(question: str) -> tuple[str, ...]:

@@ -203,6 +203,9 @@ def test_pipeline_fuses_graph_and_vector_chunks_and_validates_citations() -> Non
     )
 
     assert response.status == "answered"
+    assert response.knowledge_package is not None
+    assert response.knowledge_package["as_of"] == "2025-01-01"
+    assert response.knowledge_package["document_chunks"][0]["chunk_id"] == "CHUNK-1"
     assert response.sources[0].origins == ("graph", "vector")
     assert response.sources[0].vector_score == 0.82
     assert response.paths == graph_result.paths
