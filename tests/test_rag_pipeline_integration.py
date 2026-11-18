@@ -59,6 +59,6 @@ def test_pipeline_uses_live_retrieval_and_returns_cited_source() -> None:
     assert [source.chunk_id for source in response.sources] == [
         "DOC-058_chunk_002"
     ]
-    assert "ciclo anual" in response.sources[0].quote
+    assert "ciclo anual" in response.sources[0].text
     assert llm.messages is not None
     assert "DOC-058_chunk_002" in llm.messages[1]["content"]

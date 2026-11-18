@@ -8,6 +8,7 @@ import pytest
 from src.generation.llm import ChatMessage
 from src.rag.pipeline import (
     INSUFFICIENT_EVIDENCE_ANSWER,
+    RAG_MIN_VECTOR_SCORE,
     RAGPipeline,
     RAGResponseError,
 )
@@ -17,15 +18,16 @@ from src.retrieval.vector_search import RetrievedChunk
 class FakeSearch:
     def __init__(self, chunks: list[RetrievedChunk]) -> None:
         self.chunks = chunks
-        self.arguments: tuple[str, int, str | None] | None = None
+        self.arguments: tuple[str, int, str | None, float | None] | None = None
 
     def search(
         self,
         question: str,
         top_k: int = 5,
         document_scope: str | None = None,
+        min_vector_score: float | None = None,
     ) -> list[RetrievedChunk]:
-        self.arguments = (question, top_k, document_scope)
+        self.arguments = (question, top_k, document_scope, min_vector_score)
         return self.chunks
 
 
@@ -84,7 +86,7 @@ def test_pipeline_sends_only_current_question_and_evidence_to_llm() -> None:
     assert result.answer == "As promoções ocorrem no ciclo anual."
     assert result.sources[0].doc_id == "DOC-058"
     assert result.sources[0].chunk_id == "DOC-058_chunk_002"
-    assert result.sources[0].quote == retrieved_chunk().texto
+    assert result.sources[0].text == retrieved_chunk().texto
     assert result.sources[0].vector_score == 0.82
     assert result.sources[0].fulltext_score == 1.5
     assert result.sources[0].rank_score == 0.03
@@ -92,6 +94,7 @@ def test_pipeline_sends_only_current_question_and_evidence_to_llm() -> None:
         "Como ocorrem as promoções?",
         3,
         "ORGANIZACAO",
+        RAG_MIN_VECTOR_SCORE,
     )
     assert llm.temperature == 0.0
     assert llm.response_format == "json"
@@ -114,6 +117,86 @@ def test_pipeline_returns_insufficient_without_calling_llm_if_search_is_empty() 
     assert result.answer == INSUFFICIENT_EVIDENCE_ANSWER
     assert result.sources == []
     assert llm.messages is None
+
+
+def test_pipeline_returns_insufficient_if_all_vector_scores_are_below_threshold() -> None:
+    low_score_chunk = RetrievedChunk(
+        chunk_id="DOC-058_chunk_002",
+        doc_id="DOC-058",
+        texto="Trecho não relacionado.",
+        score=0.2,
+        rank_score=0.01,
+    )
+    search = FakeSearch([low_score_chunk])
+    llm = FakeLLM("not called")
+
+    result = RAGPipeline(search, llm, min_vector_score=0.5).answer(
+        "Pergunta sem evidências relevantes."
+    )
+
+    assert result.status == "insufficient"
+    assert result.answer == INSUFFICIENT_EVIDENCE_ANSWER
+    assert result.sources == []
+    assert llm.messages is None
+    assert search.arguments == (
+        "Pergunta sem evidências relevantes.",
+        5,
+        None,
+        0.5,
+    )
+
+
+def test_pipeline_uses_chunks_at_or_above_threshold_normally() -> None:
+    search = FakeSearch([retrieved_chunk()])
+    llm = FakeLLM(
+        json.dumps(
+            {
+                "status": "answered",
+                "answer": "As promoções ocorrem no ciclo anual.",
+                "citations": [
+                    {"doc_id": "DOC-058", "chunk_id": "DOC-058_chunk_002"}
+                ],
+            }
+        )
+    )
+
+    result = RAGPipeline(search, llm, min_vector_score=0.82).answer(
+        "Como ocorrem as promoções?"
+    )
+
+    assert result.status == "answered"
+    assert llm.messages is not None
+
+
+def test_pipeline_keeps_lexical_only_chunk_when_threshold_is_configured() -> None:
+    lexical_chunk = RetrievedChunk(
+        chunk_id="DOC-058_chunk_002",
+        doc_id="DOC-058",
+        texto="Trecho recuperado pela busca lexical.",
+        score=None,
+        rank_score=0.02,
+        fulltext_score=1.5,
+    )
+    search = FakeSearch([lexical_chunk])
+    llm = FakeLLM(
+        json.dumps(
+            {
+                "status": "answered",
+                "answer": "Resposta fundamentada no resultado lexical.",
+                "citations": [
+                    {"doc_id": "DOC-058", "chunk_id": "DOC-058_chunk_002"}
+                ],
+            }
+        )
+    )
+
+    result = RAGPipeline(search, llm, min_vector_score=0.5).answer(
+        "Pergunta respondida lexicalmente."
+    )
+
+    assert result.status == "answered"
+    assert result.sources[0].vector_score is None
+    assert llm.messages is not None
 
 
 def test_pipeline_discards_candidates_when_llm_reports_insufficient() -> None:

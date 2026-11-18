@@ -261,3 +261,85 @@ def test_search_fuses_vector_and_fulltext_by_rank_without_comparing_scores() -> 
     assert results[2].rank_score == 1 / 62
     assert database.calls[0][1]["document_scope"] == "ORGANIZACAO"
     assert database.calls[1][1]["document_scope"] == "ORGANIZACAO"
+
+
+def test_min_vector_score_filters_before_top_k_is_applied() -> None:
+    model = FakeEmbeddingModel([[0.0] * EMBEDDING_DIMENSION])
+    database = FakeDatabase(
+        [
+            {
+                "chunk_id": "BELOW",
+                "doc_id": "DOC-001",
+                "texto": "Abaixo do limiar.",
+                "vector_score": 0.2,
+            },
+            {
+                "chunk_id": "ABOVE",
+                "doc_id": "DOC-002",
+                "texto": "Acima do limiar.",
+                "vector_score": 0.6,
+            },
+        ],
+        [
+            {
+                "chunk_id": "BELOW",
+                "doc_id": "DOC-001",
+                "texto": "Abaixo do limiar.",
+                "fulltext_score": 3.0,
+            }
+        ],
+    )
+
+    results = VectorSearch(database, model).search(
+        "consulta da organização",
+        top_k=1,
+        min_vector_score=0.5,
+    )
+
+    assert [chunk.chunk_id for chunk in results] == ["ABOVE"]
+
+
+def test_min_vector_score_keeps_chunks_retrieved_only_by_fulltext() -> None:
+    model = FakeEmbeddingModel([[0.0] * EMBEDDING_DIMENSION])
+    database = FakeDatabase(
+        [
+            {
+                "chunk_id": "BELOW",
+                "doc_id": "DOC-001",
+                "texto": "Abaixo do limiar vetorial.",
+                "vector_score": 0.2,
+            }
+        ],
+        [
+            {
+                "chunk_id": "LEXICAL-ONLY",
+                "doc_id": "DOC-002",
+                "texto": "Resultado somente lexical.",
+                "fulltext_score": 2.0,
+            }
+        ],
+    )
+
+    results = VectorSearch(database, model).search(
+        "consulta da organização",
+        min_vector_score=0.5,
+    )
+
+    assert [chunk.chunk_id for chunk in results] == ["LEXICAL-ONLY"]
+    assert results[0].score is None
+
+
+@pytest.mark.parametrize("min_vector_score", [True, float("nan"), float("inf")])
+def test_search_rejects_invalid_min_vector_score(
+    min_vector_score: float,
+) -> None:
+    model = FakeEmbeddingModel([[0.0] * EMBEDDING_DIMENSION])
+    database = FakeDatabase([])
+
+    with pytest.raises(ValueError, match="min_vector_score"):
+        VectorSearch(database, model).search(
+            "consulta válida",
+            min_vector_score=min_vector_score,
+        )
+
+    assert database.calls == []

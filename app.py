@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import logging
+from datetime import date
+
 import streamlit as st
-from neo4j.exceptions import Neo4jError
+from neo4j.exceptions import CypherSyntaxError, Neo4jError
 
 from src.database.neo4j import Neo4jConfigurationError, Neo4jDatabase
 from src.generation.llm import (
@@ -18,12 +21,22 @@ from src.persistence.conversations import (
     ConversationStoreError,
     StoredSource,
 )
+from src.rag.graphrag_pipeline import (
+    GraphRAGPipeline,
+    GraphRAGResponse,
+    GraphRAGResponseError,
+)
 from src.rag.pipeline import RAGPipeline, RAGResponse, RAGResponseError
+from src.retrieval.graph_search import GraphSearch, GraphSearchError
 from src.retrieval.vector_search import (
     EmbeddingModel,
     SearchClauseVectorSearch,
+    VectorSearch,
     load_embedding_model,
 )
+logging.getLogger("streamlit").setLevel(logging.CRITICAL)
+
+LOGGER = logging.getLogger(__name__)
 
 
 SYSTEM_MESSAGE: ChatMessage = {
@@ -65,11 +78,72 @@ def _cached_embedding_model() -> EmbeddingModel:
 def answer_with_rag(question: str, document_scope: str | None) -> RAGResponse:
     with Neo4jDatabase.from_env() as database:
         database.verify_connectivity()
-        search = SearchClauseVectorSearch(database, _cached_embedding_model())
-        return RAGPipeline(search, OllamaClient.from_env()).answer(
-            question,
-            document_scope=document_scope,
-        )
+        embedding_model = _cached_embedding_model()
+        llm = OllamaClient.from_env()
+        search_clause = SearchClauseVectorSearch(database, embedding_model)
+        try:
+            response = RAGPipeline(search_clause, llm).answer(
+                question,
+                document_scope=document_scope,
+            )
+        except CypherSyntaxError as exc:
+            LOGGER.warning(
+                "SEARCH do Neo4j indisponível (%s); usando as procedures clássicas.",
+                type(exc).__name__,
+            )
+            search_procedures = VectorSearch(database, embedding_model)
+            response = RAGPipeline(search_procedures, llm).answer(
+                question,
+                document_scope=document_scope,
+            )
+            LOGGER.info("Recuperação RAG concluída pelo caminho de procedures.")
+            return response
+
+        LOGGER.info("Recuperação RAG concluída pelo caminho Cypher 25 SEARCH.")
+        return response
+
+
+def answer_with_graphrag(
+    question: str,
+    document_scope: str | None,
+    as_of: date,
+) -> GraphRAGResponse:
+    with Neo4jDatabase.from_env() as database:
+        database.verify_connectivity()
+        embedding_model = _cached_embedding_model()
+        llm = OllamaClient.from_env()
+        graph_search = GraphSearch(database)
+        search_clause = SearchClauseVectorSearch(database, embedding_model)
+        try:
+            response = GraphRAGPipeline(
+                search_clause,
+                graph_search,
+                llm,
+            ).answer(
+                question,
+                document_scope=document_scope,
+                as_of=as_of,
+            )
+        except CypherSyntaxError as exc:
+            LOGGER.warning(
+                "SEARCH do Neo4j indisponível (%s); usando as procedures clássicas.",
+                type(exc).__name__,
+            )
+            search_procedures = VectorSearch(database, embedding_model)
+            response = GraphRAGPipeline(
+                search_procedures,
+                graph_search,
+                llm,
+            ).answer(
+                question,
+                document_scope=document_scope,
+                as_of=as_of,
+            )
+            LOGGER.info("Recuperação GraphRAG concluída pelo caminho de procedures.")
+            return response
+
+        LOGGER.info("Recuperação GraphRAG concluída pelo caminho Cypher 25 SEARCH.")
+        return response
 
 
 def restore_conversation(mode: str, saved: Conversation) -> None:
@@ -166,6 +240,18 @@ def main() -> None:
         st.session_state.rag_sources = []
     if "rag_status" not in st.session_state:
         st.session_state.rag_status = None
+    if "graphrag_messages" not in st.session_state:
+        st.session_state.graphrag_messages = []
+    if "graphrag_sources" not in st.session_state:
+        st.session_state.graphrag_sources = []
+    if "graphrag_paths" not in st.session_state:
+        st.session_state.graphrag_paths = []
+    if "graphrag_cypher" not in st.session_state:
+        st.session_state.graphrag_cypher = ""
+    if "graphrag_status" not in st.session_state:
+        st.session_state.graphrag_status = None
+    if "graphrag_result_as_of" not in st.session_state:
+        st.session_state.graphrag_result_as_of = None
 
     store: ConversationStore | None = None
     store_error: str | None = None
@@ -185,12 +271,12 @@ def main() -> None:
         mode = st.selectbox(
             "Modo de busca",
             ("Conversa direta", "RAG", "GraphRAG", "KAG"),
-            help="RAG está disponível; GraphRAG e KAG ainda estão em desenvolvimento.",
+            help="RAG está disponível. GraphRAG cobre consultas hierárquicas com pessoa ou cargo CEO canônico.",
             filter_mode=None,
         )
         document_scope: str | None = "ORGANIZACAO"
         rag_authorized = False
-        if mode == "RAG":
+        if mode in {"RAG", "GraphRAG"}:
             scope_options = {
                 "Somente organização": "ORGANIZACAO",
                 "Somente pessoas": "PESSOA",
@@ -202,14 +288,26 @@ def main() -> None:
                 help="O escopo é escolhido explicitamente e não é inferido da pergunta.",
             )
             document_scope = scope_options[scope_label]
-            st.warning(
-                "RAG envia sua pergunta, doc_id/chunk_id e trechos recuperados "
-                "ao Ollama via Tailscale. Use somente dados saneados; no escopo "
-                "PESSOA, confirme que o envio está autorizado."
-            )
+            if mode == "RAG":
+                st.warning(
+                    "RAG envia sua pergunta, doc_id/chunk_id e trechos recuperados "
+                    "ao Ollama via Tailscale. Use somente dados saneados; no escopo "
+                    "PESSOA, confirme que o envio está autorizado."
+                )
+            else:
+                st.warning(
+                    "GraphRAG envia a pergunta, caminho hierárquico e chunks "
+                    "recuperados ao Ollama via Tailscale. A busca atual exige "
+                    "uma pergunta hierárquica sobre pessoa canônica ou CEO. "
+                    "A hierarquia é consultada na data atual. Use dados saneados "
+                    "e autorize o envio."
+                )
+                st.caption(
+                    "O histórico GraphRAG não é persistido e fica somente nesta sessão."
+                )
             rag_authorized = st.checkbox(
-                "Entendi e autorizo o envio da pergunta, IDs e trechos recuperados.",
-                key="rag_remote_consent",
+                "Entendi e autorizo o envio da pergunta, IDs, caminho e trechos recuperados.",
+                key="remote_evidence_consent",
             )
         history_mode = (
             "direct" if mode == "Conversa direta" else "RAG" if mode == "RAG" else None
@@ -307,6 +405,13 @@ def main() -> None:
                 st.session_state.rag_messages = []
                 st.session_state.rag_sources = []
                 st.session_state.rag_status = None
+            elif mode == "GraphRAG":
+                st.session_state.graphrag_messages = []
+                st.session_state.graphrag_sources = []
+                st.session_state.graphrag_paths = []
+                st.session_state.graphrag_cypher = ""
+                st.session_state.graphrag_status = None
+                st.session_state.graphrag_result_as_of = None
             if history_mode is not None:
                 st.session_state[f"new_conversation_requested_{history_mode}"] = True
             st.rerun()
@@ -349,6 +454,12 @@ def main() -> None:
                 "O histórico não é enviado como evidência."
             )
             visible_messages = st.session_state.rag_messages
+        elif mode == "GraphRAG":
+            st.info(
+                "GraphRAG percorre relações hierárquicas válidas na data atual "
+                "e combina o caminho com chunks recuperados. O histórico não é evidência."
+            )
+            visible_messages = st.session_state.graphrag_messages
         else:
             st.warning(
                 f"{mode} ainda não está disponível; nenhuma busca será executada."
@@ -363,6 +474,11 @@ def main() -> None:
                     st.subheader("Como posso ajudar?")
                     if mode == "RAG":
                         st.write("Faça uma pergunta sobre os documentos de RH da NovaTech.")
+                    elif mode == "GraphRAG":
+                        st.write(
+                            "Pergunte pelos subordinados de uma pessoa usando o nome "
+                            "canônico completo."
+                        )
                     else:
                         st.write("Faça uma pergunta para testar a conversa.")
 
@@ -373,8 +489,8 @@ def main() -> None:
         prompt = st.chat_input(
             "Escreva sua mensagem",
             disabled=(
-                mode in {"GraphRAG", "KAG"}
-                or (mode == "RAG" and not rag_authorized)
+                mode == "KAG"
+                or (mode in {"RAG", "GraphRAG"} and not rag_authorized)
             ),
         )
         if prompt:
@@ -456,7 +572,7 @@ def main() -> None:
                                         StoredSource(
                                             doc_id=source.doc_id,
                                             chunk_id=source.chunk_id,
-                                            quote=source.quote,
+                                            quote=source.text,
                                             vector_score=source.vector_score,
                                             fulltext_score=source.fulltext_score,
                                             rank_score=source.rank_score,
@@ -482,6 +598,48 @@ def main() -> None:
                         st.session_state.rag_status = response.status
                         with st.chat_message("assistant"):
                             st.markdown(response.answer)
+                elif mode == "GraphRAG":
+                    st.session_state.graphrag_sources = []
+                    st.session_state.graphrag_paths = []
+                    st.session_state.graphrag_cypher = ""
+                    st.session_state.graphrag_status = None
+                    st.session_state.graphrag_result_as_of = None
+                    try:
+                        with st.spinner(
+                            "Percorrendo o grafo e buscando evidências documentais..."
+                        ):
+                            response = answer_with_graphrag(
+                                prompt,
+                                document_scope,
+                                date.today(),
+                            )
+                    except (LLMConfigurationError, LLMRequestError) as exc:
+                        st.error(f"Não foi possível consultar o Ollama: {exc}")
+                    except Neo4jConfigurationError as exc:
+                        st.error(f"Não foi possível configurar o Neo4j: {exc}")
+                    except Neo4jError as exc:
+                        st.error(f"Falha ao consultar o Neo4j: {exc}")
+                    except GraphSearchError as exc:
+                        st.error(f"Falha ao resolver ou percorrer o grafo: {exc}")
+                    except GraphRAGResponseError as exc:
+                        st.error(f"A resposta do GraphRAG foi inválida: {exc}")
+                    except RuntimeError as exc:
+                        st.error(f"Não foi possível executar o GraphRAG: {exc}")
+                    else:
+                        assistant_message = {
+                            "role": "assistant",
+                            "content": response.answer,
+                        }
+                        st.session_state.graphrag_messages.extend(
+                            [user_message, assistant_message]
+                        )
+                        st.session_state.graphrag_sources = response.sources
+                        st.session_state.graphrag_paths = response.paths
+                        st.session_state.graphrag_cypher = response.cypher
+                        st.session_state.graphrag_status = response.status
+                        st.session_state.graphrag_result_as_of = response.as_of
+                        with st.chat_message("assistant"):
+                            st.markdown(response.answer)
 
     with evidence:
         st.subheader("Documentos e referências")
@@ -491,7 +649,8 @@ def main() -> None:
                 for source in st.session_state.rag_sources:
                     with st.container(border=True):
                         st.markdown(f"**{source.doc_id} · {source.chunk_id}**")
-                        st.write(source.quote)
+                        st.caption("Chunk recuperado completo")
+                        st.write(source.text)
                         with st.expander("Sinais de recuperação"):
                             st.write(f"Similaridade vetorial: {source.vector_score}")
                             st.write(f"Score full-text: {source.fulltext_score}")
@@ -500,6 +659,26 @@ def main() -> None:
                 st.info("A resposta mais recente não citou fontes: evidência insuficiente.")
             else:
                 st.write("Nenhuma busca RAG foi concluída nesta conversa.")
+        elif mode == "GraphRAG":
+            st.caption("Chunks citados pela resposta GraphRAG mais recente")
+            if st.session_state.graphrag_sources:
+                for source in st.session_state.graphrag_sources:
+                    with st.container(border=True):
+                        st.markdown(f"**{source.doc_id} · {source.chunk_id}**")
+                        st.caption(
+                            "Origem: " + ", ".join(source.origins)
+                        )
+                        st.write(source.text)
+                        with st.expander("Sinais de recuperação"):
+                            st.write(f"Similaridade vetorial: {source.vector_score}")
+                            st.write(f"Score full-text: {source.fulltext_score}")
+                            st.write(f"RRF rank score: {source.rank_score}")
+            elif st.session_state.graphrag_status == "insufficient":
+                st.info(
+                    "A resposta GraphRAG mais recente não citou chunks documentais."
+                )
+            else:
+                st.write("Nenhuma busca GraphRAG foi concluída nesta sessão.")
         else:
             with st.container(border=True):
                 st.write("Nenhuma busca documental foi realizada.")
@@ -507,12 +686,42 @@ def main() -> None:
                     "Selecione RAG para consultar documentos e exibir as fontes."
                 )
         st.subheader("Caminho no grafo")
-        with st.container(border=True):
-            st.write("Visualização do caminho indisponível.")
-            st.caption(
-                "O RAG recupera trechos documentais, mas não percorre relações. "
-                "GraphRAG/KAG ainda não estão disponíveis."
-            )
+        if mode == "GraphRAG" and st.session_state.graphrag_paths:
+            for path_number, path in enumerate(
+                st.session_state.graphrag_paths,
+                start=1,
+            ):
+                with st.container(border=True):
+                    st.markdown(f"**Caminho {path_number}**")
+                    st.write(
+                        " → ".join(
+                            f"{person.nome} ({person.funcionario_id})"
+                            for person in path.people
+                        )
+                    )
+                    for relationship in path.relationships:
+                        valid_to = (
+                            relationship.valid_to.isoformat()
+                            if relationship.valid_to is not None
+                            else "sem data final"
+                        )
+                        st.caption(
+                            f"{relationship.source_id} -REPORTS_TO→ "
+                            f"{relationship.target_id} · {relationship.relacao_id} · "
+                            f"{relationship.valid_from.isoformat()} a {valid_to}"
+                        )
+                        if relationship.source_references:
+                            st.caption(
+                                "Referências: "
+                                + ", ".join(relationship.source_references)
+                            )
+        else:
+            with st.container(border=True):
+                st.write("Nenhum caminho GraphRAG foi recuperado.")
+                st.caption(
+                    "A busca estruturada hierárquica está disponível no modo "
+                    "GraphRAG; o RAG documental não percorre relações."
+                )
         with st.expander("Consulta e detalhes da busca"):
             if mode == "RAG":
                 scope_label = (
@@ -526,10 +735,22 @@ def main() -> None:
                     f"Escopo explícito: {scope_label}. "
                     "Scores são sinais de recuperação, não confiança."
                 )
+            elif mode == "GraphRAG":
+                result_as_of = (
+                    st.session_state.graphrag_result_as_of
+                    or date.today()
+                )
+                st.caption(
+                    "Travessia hierárquica temporal. A data inclusiva usada "
+                    f"foi {result_as_of.isoformat()}. "
+                    "Os resultados não incluem score de confiança."
+                )
+                if st.session_state.graphrag_cypher:
+                    st.code(st.session_state.graphrag_cypher, language="cypher")
             else:
                 st.caption(
-                    "GraphRAG/KAG e consultas estruturadas de relações "
-                    "ainda não estão disponíveis."
+                    "KAG e visualização interativa do subgrafo ainda não estão "
+                    "disponíveis."
                 )
 
 

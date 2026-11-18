@@ -12,7 +12,7 @@ Este documento define a primeira versão do modelo **Labeled Property Graph (LPG
 
 A implementação inicial cobre o dataset disponível: 27 pessoas, 24 cargos canônicos, 9 departamentos, 3 organizações e 60 documentos TXT. Não presume dados ausentes nem converte o prestador PJ E026 em empregado.
 
-> O desenvolvimento atual pode permanecer backend-only. Porém, a especificação da disciplina também exige, na entrega final, interface funcional, visualização interativa do subgrafo, lista de nós consultados, Cypher gerada e nível de confiança. Portanto, a API deve expor esses dados desde já.
+> O desenvolvimento atual pode permanecer backend-only. Porém, a especificação da disciplina também exige, na entrega final, interface funcional, visualização interativa do subgrafo, lista de nós consultados e consulta Cypher usada. A consulta deve vir de templates allowlisted, nunca de Cypher arbitrária do LLM. Exponha confiança somente se houver métrica calibrada; não invente score.
 
 ## 2. Entidades (nodes)
 
@@ -53,7 +53,7 @@ A implementação inicial cobre o dataset disponível: 27 pessoas, 24 cargos can
 | `(Documento)-[:ENVOLVE_ORGANIZACAO]->(Organizacao)` | — | `organizacoes_envolvidas_ids`. |
 | `(Documento)-[:RELACIONADO_A]->(Documento)` | — | `docs_relacionados`. |
 | `(Documento)-[:TEM_TRECHO]->(Chunk)` | `ordem` opcional | Criado no chunking. |
-| `(Chunk)-[:MENCIONA]->(Pessoa\|Cargo\|Departamento\|Organizacao)` | `confidence`, `extraction_method`, `review_status` | Extração NER/RE; manter ligação ao trecho-fonte. |
+| `(Chunk)-[:MENCIONA]->(Pessoa\|Cargo\|Departamento\|Organizacao)` | `surface_form`, `start_char`, `end_char`, `extraction_method`, `review_status`; `confidence` não é preenchido sem calibração | Baseline determinístico registra a ocorrência literal no chunk; extração NER/RE semântica e revisão de aliases permanecem pendentes. |
 
 **Atenção à direção:** `SUPERVISIONA_ESTAGIO` deve sair do supervisor e apontar para o estagiário. A relação hierárquica `REPORTS_TO` é outra relação, com significado diferente.
 
@@ -129,7 +129,7 @@ MATCH path = (raiz:Pessoa {funcionario_id: $gestor_id})<-[:REPORTS_TO*1..5]-(p:P
 WHERE all(r IN relationships(path) WHERE
   r.valid_from <= date($data) AND (r.valid_to IS NULL OR r.valid_to >= date($data)))
 RETURN p.funcionario_id, p.nome, length(path) AS distancia
-ORDER BY distancia, p.nome;
+ORDER BY distancia, p.nome, p.funcionario_id;
 ```
 
 ### 7.5 Caminho de evidência de um documento
@@ -154,7 +154,7 @@ Para cumprir a rubrica, selecionar pelo menos um algoritmo de grafo para enrique
 ```json
 {
   "answer": "Resposta em linguagem natural",
-  "sources": [{"doc_id": "DOC-...", "chunk_id": "...", "quote": "..."}],
+  "sources": [{"doc_id": "DOC-...", "chunk_id": "...", "text": "texto completo do chunk recuperado"}],
   "graph": {
     "nodes": [{"id": "E...", "label": "Pessoa", "name": "..."}],
     "edges": [{"source": "E...", "target": "E...", "type": "REPORTS_TO"}]

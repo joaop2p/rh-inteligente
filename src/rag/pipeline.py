@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol
@@ -14,6 +15,7 @@ from src.retrieval.vector_search import RetrievedChunk
 INSUFFICIENT_EVIDENCE_ANSWER = (
     "Não encontrei evidências documentais suficientes para responder a essa pergunta."
 )
+RAG_MIN_VECTOR_SCORE: float | None = None
 
 RAG_SYSTEM_MESSAGE: ChatMessage = {
     "role": "system",
@@ -42,6 +44,7 @@ class Search(Protocol):
         question: str,
         top_k: int = 5,
         document_scope: str | None = None,
+        min_vector_score: float | None = None,
     ) -> list[RetrievedChunk]: ...
 
 
@@ -61,11 +64,11 @@ class RAGResponseError(RuntimeError):
 
 @dataclass(frozen=True)
 class RAGSource:
-    """Evidência citada, com identificadores canônicos e sinais de recuperação."""
+    """Chunk recuperado e citado, com proveniência e sinais de recuperação."""
 
     doc_id: str
     chunk_id: str
-    quote: str
+    text: str
     vector_score: float | None
     fulltext_score: float | None
     rank_score: float
@@ -83,9 +86,22 @@ class RAGResponse:
 class RAGPipeline:
     """Recupera evidências e solicita ao LLM uma resposta estruturada e citada."""
 
-    def __init__(self, search: Search, llm: ChatModel) -> None:
+    def __init__(
+        self,
+        search: Search,
+        llm: ChatModel,
+        *,
+        min_vector_score: float | None = RAG_MIN_VECTOR_SCORE,
+    ) -> None:
+        if min_vector_score is not None and (
+            isinstance(min_vector_score, bool)
+            or not isinstance(min_vector_score, (int, float))
+            or not math.isfinite(min_vector_score)
+        ):
+            raise ValueError("min_vector_score deve ser um número finito ou None.")
         self._search = search
         self._llm = llm
+        self._min_vector_score = min_vector_score
 
     def answer(
         self,
@@ -101,7 +117,14 @@ class RAGPipeline:
             question.strip(),
             top_k=top_k,
             document_scope=document_scope,
+            min_vector_score=self._min_vector_score,
         )
+        if self._min_vector_score is not None:
+            chunks = [
+                chunk
+                for chunk in chunks
+                if chunk.score is None or chunk.score >= self._min_vector_score
+            ]
         if not chunks:
             return RAGResponse(
                 answer=INSUFFICIENT_EVIDENCE_ANSWER,
@@ -201,7 +224,7 @@ class RAGPipeline:
                 RAGSource(
                     doc_id=chunk.doc_id,
                     chunk_id=chunk.chunk_id,
-                    quote=chunk.texto,
+                    text=chunk.texto,
                     vector_score=chunk.score,
                     fulltext_score=chunk.fulltext_score,
                     rank_score=chunk.rank_score,

@@ -161,6 +161,7 @@ class VectorSearch:
         question: str,
         top_k: int = DEFAULT_TOP_K,
         document_scope: str | None = None,
+        min_vector_score: float | None = None,
     ) -> list[RetrievedChunk]:
         """Retorna chunks fundidos por ranking; escopo limita os documentos elegíveis."""
         return self._search(
@@ -169,6 +170,7 @@ class VectorSearch:
             document_scope,
             VECTOR_SEARCH_QUERY,
             FULLTEXT_SEARCH_QUERY,
+            min_vector_score,
         )
 
     def _search(
@@ -178,11 +180,18 @@ class VectorSearch:
         document_scope: str | None,
         vector_query: str,
         fulltext_query_template: str,
+        min_vector_score: float | None = None,
     ) -> list[RetrievedChunk]:
         if not isinstance(question, str) or not question.strip():
             raise ValueError("A pergunta deve ser um texto não vazio.")
         if not isinstance(top_k, int) or isinstance(top_k, bool) or top_k <= 0:
             raise ValueError("top_k deve ser um inteiro maior que zero.")
+        if min_vector_score is not None and (
+            isinstance(min_vector_score, bool)
+            or not isinstance(min_vector_score, (int, float))
+            or not math.isfinite(min_vector_score)
+        ):
+            raise ValueError("min_vector_score deve ser um número finito ou None.")
         if document_scope is not None and document_scope not in DOCUMENT_SCOPES:
             raise ValueError(
                 "document_scope deve ser ORGANIZACAO, PESSOA ou None."
@@ -227,7 +236,12 @@ class VectorSearch:
 
         lucene_query = self._to_fulltext_query(question)
         if not lucene_query:
-            return self._fuse(vector_chunks, [], top_k)
+            return self._fuse(
+                vector_chunks,
+                [],
+                top_k,
+                min_vector_score=min_vector_score,
+            )
 
         fulltext_records = self._database.execute_read(
             fulltext_query_template,
@@ -242,7 +256,13 @@ class VectorSearch:
             self._parse_record(record, "fulltext_score")
             for record in fulltext_records
         ]
-        return self._fuse(vector_chunks, fulltext_chunks, top_k)
+        return self._fuse(
+            vector_chunks,
+            fulltext_chunks,
+            top_k,
+            min_vector_score=min_vector_score,
+        )
+
     @staticmethod
     def _to_fulltext_query(question: str) -> str:
         terms = dict.fromkeys(re.findall(r"[\w]+", question, flags=re.UNICODE))
@@ -284,6 +304,8 @@ class VectorSearch:
         vector_chunks: list[RetrievedChunk],
         fulltext_chunks: list[RetrievedChunk],
         top_k: int,
+        *,
+        min_vector_score: float | None = None,
     ) -> list[RetrievedChunk]:
         merged: dict[str, dict[str, Any]] = {}
         for rank, chunk in enumerate(vector_chunks, start=1):
@@ -324,6 +346,12 @@ class VectorSearch:
                     fulltext_score=item["fulltext_score"],
                 )
             )
+        if min_vector_score is not None:
+            results = [
+                chunk
+                for chunk in results
+                if chunk.score is None or chunk.score >= min_vector_score
+            ]
         results.sort(
             key=lambda chunk: (
                 chunk.rank_score,
@@ -343,6 +371,7 @@ class SearchClauseVectorSearch(VectorSearch):
         question: str,
         top_k: int = DEFAULT_TOP_K,
         document_scope: str | None = None,
+        min_vector_score: float | None = None,
     ) -> list[RetrievedChunk]:
         return self._search(
             question,
@@ -350,4 +379,5 @@ class SearchClauseVectorSearch(VectorSearch):
             document_scope,
             VECTOR_SEARCH_CLAUSE_QUERY,
             FULLTEXT_SEARCH_CLAUSE_QUERY,
+            min_vector_score,
         )

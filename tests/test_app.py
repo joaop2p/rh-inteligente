@@ -1,22 +1,55 @@
 from __future__ import annotations
 
 import json
+import logging
+from datetime import date
 from pathlib import Path
 from typing import Literal, Sequence
 
 from cryptography.fernet import Fernet
 import pytest
+from neo4j.exceptions import CypherSyntaxError, ServiceUnavailable
 from streamlit.proto.SelectWidgetFilterMode_pb2 import FILTER_MODE_NONE
 from streamlit.testing.v1 import AppTest
 
+import app as app_module
 from src.database.neo4j import Neo4jDatabase
 from src.generation.llm import ChatMessage, LLMRequestError, OllamaClient
-from src.persistence.conversations import ConversationStore
-from src.retrieval.vector_search import RetrievedChunk, SearchClauseVectorSearch
+from src.persistence.conversations import (
+    ConversationStore,
+    ConversationStoreConfigurationError,
+)
+from src.retrieval.vector_search import (
+    RetrievedChunk,
+    SearchClauseVectorSearch,
+    VectorSearch,
+)
+from src.retrieval.graph_search import (
+    GraphEvidence,
+    GraphPath,
+    GraphPerson,
+    GraphRelationship,
+    GraphSearch,
+    GraphSearchResult,
+)
 import src.retrieval.vector_search as vector_search
 
 
 APP_PATH = Path(__file__).resolve().parents[1] / "app.py"
+
+
+@pytest.fixture(autouse=True)
+def disable_local_conversation_store(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unavailable(cls: type[ConversationStore]) -> ConversationStore:
+        raise ConversationStoreConfigurationError("Persistência desabilitada nos testes.")
+
+    monkeypatch.setattr(
+        ConversationStore,
+        "from_env",
+        classmethod(unavailable),
+    )
 
 
 class FakeDatabase:
@@ -59,6 +92,260 @@ class FakeRAGLLM:
         )
 
 
+def test_answer_with_rag_uses_search_clause_when_supported(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="app")
+    database = FakeDatabase()
+    llm = FakeRAGLLM()
+    search_calls: list[str] = []
+    retrieved = RetrievedChunk(
+        chunk_id="DOC-058_chunk_002",
+        doc_id="DOC-058",
+        texto="Promoções seguem o ciclo anual.",
+        score=0.82,
+        rank_score=0.03,
+    )
+
+    def search_clause(
+        self: SearchClauseVectorSearch,
+        question: str,
+        top_k: int = 5,
+        document_scope: str | None = None,
+        min_vector_score: float | None = None,
+    ) -> list[RetrievedChunk]:
+        search_calls.append("SEARCH")
+        return [retrieved]
+
+    def fail_procedures(*args: object, **kwargs: object) -> list[RetrievedChunk]:
+        pytest.fail("O caminho de procedures não deveria ser usado.")
+
+    monkeypatch.setattr(
+        Neo4jDatabase,
+        "from_env",
+        classmethod(lambda cls: database),
+    )
+    monkeypatch.setattr(app_module, "_cached_embedding_model", lambda: object())
+    monkeypatch.setattr(
+        OllamaClient,
+        "from_env",
+        classmethod(lambda cls: llm),
+    )
+    monkeypatch.setattr(SearchClauseVectorSearch, "search", search_clause)
+    monkeypatch.setattr(VectorSearch, "search", fail_procedures)
+
+    response = app_module.answer_with_rag("Como são as promoções?", None)
+
+    assert response.status == "answered"
+    assert search_calls == ["SEARCH"]
+    assert database.verified
+    assert database.closed
+    assert "caminho Cypher 25 SEARCH" in caplog.text
+
+
+def test_answer_with_rag_falls_back_on_cypher_syntax_error(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="app")
+    database = FakeDatabase()
+    llm = FakeRAGLLM()
+    search_calls: list[str] = []
+    retrieved = RetrievedChunk(
+        chunk_id="DOC-058_chunk_002",
+        doc_id="DOC-058",
+        texto="Promoções seguem o ciclo anual.",
+        score=0.82,
+        rank_score=0.03,
+    )
+
+    def search_clause(
+        self: SearchClauseVectorSearch,
+        question: str,
+        top_k: int = 5,
+        document_scope: str | None = None,
+        min_vector_score: float | None = None,
+    ) -> list[RetrievedChunk]:
+        search_calls.append("SEARCH")
+        raise CypherSyntaxError("SEARCH is not supported")
+
+    def search_procedures(
+        self: VectorSearch,
+        question: str,
+        top_k: int = 5,
+        document_scope: str | None = None,
+        min_vector_score: float | None = None,
+    ) -> list[RetrievedChunk]:
+        search_calls.append("procedures")
+        return [retrieved]
+
+    monkeypatch.setattr(
+        Neo4jDatabase,
+        "from_env",
+        classmethod(lambda cls: database),
+    )
+    monkeypatch.setattr(app_module, "_cached_embedding_model", lambda: object())
+    monkeypatch.setattr(
+        OllamaClient,
+        "from_env",
+        classmethod(lambda cls: llm),
+    )
+    monkeypatch.setattr(SearchClauseVectorSearch, "search", search_clause)
+    monkeypatch.setattr(VectorSearch, "search", search_procedures)
+
+    response = app_module.answer_with_rag("Como são as promoções?", None)
+
+    assert response.status == "answered"
+    assert search_calls == ["SEARCH", "procedures"]
+    assert database.closed
+    assert "SEARCH do Neo4j indisponível" in caplog.text
+    assert "caminho de procedures" in caplog.text
+
+
+def test_answer_with_rag_does_not_fallback_on_other_neo4j_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = FakeDatabase()
+    llm = FakeRAGLLM()
+    search_calls: list[str] = []
+
+    def fail_search(
+        self: SearchClauseVectorSearch,
+        question: str,
+        top_k: int = 5,
+        document_scope: str | None = None,
+        min_vector_score: float | None = None,
+    ) -> list[RetrievedChunk]:
+        search_calls.append("SEARCH")
+        raise ServiceUnavailable("Neo4j is unavailable")
+
+    def fail_procedures(*args: object, **kwargs: object) -> list[RetrievedChunk]:
+        search_calls.append("procedures")
+        return []
+
+    monkeypatch.setattr(
+        Neo4jDatabase,
+        "from_env",
+        classmethod(lambda cls: database),
+    )
+    monkeypatch.setattr(app_module, "_cached_embedding_model", lambda: object())
+    monkeypatch.setattr(
+        OllamaClient,
+        "from_env",
+        classmethod(lambda cls: llm),
+    )
+    monkeypatch.setattr(SearchClauseVectorSearch, "search", fail_search)
+    monkeypatch.setattr(VectorSearch, "search", fail_procedures)
+
+    with pytest.raises(ServiceUnavailable, match="unavailable"):
+        app_module.answer_with_rag("Como são as promoções?", None)
+
+    assert search_calls == ["SEARCH"]
+    assert database.closed
+
+
+def test_answer_with_graphrag_uses_graph_evidence_and_vector_search(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = FakeDatabase()
+    llm = FakeRAGLLM()
+    retrieved = RetrievedChunk(
+        chunk_id="DOC-058_chunk_002",
+        doc_id="DOC-058",
+        texto="Promoções seguem o ciclo anual.",
+        score=0.82,
+        rank_score=0.03,
+    )
+    graph_result = GraphSearchResult(
+        paths=(
+            GraphPath(
+                people=(
+                    GraphPerson("E-015", "Pessoa subordinada"),
+                    GraphPerson("E-007", "Gerente de Tecnologia"),
+                ),
+                relationships=(
+                    GraphRelationship(
+                        relacao_id="REL-15-07",
+                        source_id="E-015",
+                        target_id="E-007",
+                        valid_from=date(2024, 1, 1),
+                        valid_to=None,
+                        source_references=("DOC-015",),
+                    ),
+                ),
+            ),
+        ),
+        evidence=(
+            GraphEvidence(
+                doc_id="DOC-058",
+                chunk_id="DOC-058_chunk_002",
+                text="Promoções seguem o ciclo anual.",
+                funcionario_id="E-015",
+            ),
+        ),
+        cypher="MATCH path=(p:Pessoa)-[:REPORTS_TO*1..5]->(g:Pessoa)",
+        as_of=date(2025, 1, 1),
+    )
+
+    def fake_people(
+        self: GraphSearch,
+        text: str,
+    ) -> tuple[GraphPerson, ...]:
+        return (GraphPerson("E-007", "Gerente de Tecnologia"),)
+
+    def fake_reporting_chain(
+        self: GraphSearch,
+        manager_id: str,
+        *,
+        as_of: date,
+        max_paths: int = 100,
+        document_scope: str | None = None,
+    ) -> GraphSearchResult:
+        assert document_scope == "PESSOA"
+        assert manager_id == "E-007"
+        assert as_of == date(2025, 1, 1)
+        return graph_result
+
+    def fake_search(
+        self: SearchClauseVectorSearch,
+        question: str,
+        top_k: int = 5,
+        document_scope: str | None = None,
+        min_vector_score: float | None = None,
+    ) -> list[RetrievedChunk]:
+        assert document_scope == "PESSOA"
+        return [retrieved]
+
+    monkeypatch.setattr(
+        Neo4jDatabase,
+        "from_env",
+        classmethod(lambda cls: database),
+    )
+    monkeypatch.setattr(app_module, "_cached_embedding_model", lambda: object())
+    monkeypatch.setattr(
+        OllamaClient,
+        "from_env",
+        classmethod(lambda cls: llm),
+    )
+    monkeypatch.setattr(GraphSearch, "people_mentioned_in", fake_people)
+    monkeypatch.setattr(GraphSearch, "reporting_chain", fake_reporting_chain)
+    monkeypatch.setattr(SearchClauseVectorSearch, "search", fake_search)
+
+    response = app_module.answer_with_graphrag(
+        "Quais são os subordinados de Gerente de Tecnologia?",
+        "PESSOA",
+        date(2025, 1, 1),
+    )
+
+    assert response.status == "answered"
+    assert response.paths == graph_result.paths
+    assert response.sources[0].doc_id == "DOC-058"
+    assert response.sources[0].origins == ("graph", "vector")
+    assert database.verified
+    assert database.closed
+
+
 def test_direct_chat_preserves_history_and_can_be_cleared(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -97,7 +384,7 @@ def test_search_selector_is_not_editable_and_model_selector_is_absent() -> None:
     assert not app.text_input
 
 
-@pytest.mark.parametrize("mode", ["GraphRAG", "KAG"])
+@pytest.mark.parametrize("mode", ["KAG"])
 def test_unimplemented_search_modes_do_not_enable_chat(mode: str) -> None:
     app = AppTest.from_file(APP_PATH).run()
     app.selectbox[0].set_value(mode).run()
@@ -105,6 +392,19 @@ def test_unimplemented_search_modes_do_not_enable_chat(mode: str) -> None:
     assert not app.exception
     assert app.chat_input[0].disabled
     assert any("ainda não está disponível" in warning.value for warning in app.warning)
+
+
+def test_graphrag_mode_requires_remote_consent() -> None:
+    app = AppTest.from_file(APP_PATH).run()
+    app.selectbox[0].set_value("GraphRAG").run()
+
+    assert not app.exception
+    assert app.chat_input[0].disabled
+    assert app.checkbox[0].value is False
+    assert len(app.selectbox) == 2
+    assert not app.date_input
+    app.checkbox[0].check().run()
+    assert not app.chat_input[0].disabled
 
 
 def test_rag_mode_requires_remote_consent() -> None:
@@ -139,6 +439,7 @@ def test_rag_mode_queries_pipeline_and_displays_sources(
         question: str,
         top_k: int = 5,
         document_scope: str | None = None,
+        min_vector_score: float | None = None,
     ) -> list[RetrievedChunk]:
         search_calls.append((question, top_k, document_scope))
         return [retrieved]
@@ -189,6 +490,119 @@ def test_rag_mode_queries_pipeline_and_displays_sources(
     saved = store.load_conversation(app.session_state.rag_conversation_id)
     assert saved.messages[-1].sources[0].doc_id == "DOC-058"
     assert saved.messages[-1].sources[0].chunk_id == "DOC-058_chunk_002"
+
+
+def test_graphrag_mode_runs_and_displays_sources_and_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected_as_of = date.today()
+    database = FakeDatabase()
+    llm = FakeRAGLLM()
+    retrieved = RetrievedChunk(
+        chunk_id="DOC-058_chunk_002",
+        doc_id="DOC-058",
+        texto="Promoções seguem o ciclo anual.",
+        score=0.82,
+        rank_score=0.03,
+        fulltext_score=1.5,
+    )
+    graph_result = GraphSearchResult(
+        paths=(
+            GraphPath(
+                people=(
+                    GraphPerson("E-015", "Pessoa subordinada"),
+                    GraphPerson("E-007", "Gerente de Tecnologia"),
+                ),
+                relationships=(
+                    GraphRelationship(
+                        relacao_id="REL-15-07",
+                        source_id="E-015",
+                        target_id="E-007",
+                        valid_from=date(2024, 1, 1),
+                        valid_to=None,
+                        source_references=("DOC-015",),
+                    ),
+                ),
+            ),
+        ),
+        evidence=(
+            GraphEvidence(
+                doc_id="DOC-058",
+                chunk_id="DOC-058_chunk_002",
+                text="Promoções seguem o ciclo anual.",
+                funcionario_id="E-015",
+            ),
+        ),
+        cypher="MATCH path=(p:Pessoa)-[:REPORTS_TO*1..5]->(g:Pessoa)",
+        as_of=date(2025, 1, 1),
+    )
+    graph_calls: list[tuple[str, date]] = []
+    search_calls: list[tuple[str, str | None]] = []
+
+    def fake_people(
+        self: GraphSearch,
+        text: str,
+    ) -> tuple[GraphPerson, ...]:
+        return (GraphPerson("E-007", "Gerente de Tecnologia"),)
+
+    def fake_reporting_chain(
+        self: GraphSearch,
+        manager_id: str,
+        *,
+        as_of: date,
+        max_paths: int = 100,
+        document_scope: str | None = None,
+    ) -> GraphSearchResult:
+        assert document_scope == "PESSOA"
+        graph_calls.append((manager_id, as_of))
+        return graph_result
+
+    def fake_search(
+        self: SearchClauseVectorSearch,
+        question: str,
+        top_k: int = 5,
+        document_scope: str | None = None,
+        min_vector_score: float | None = None,
+    ) -> list[RetrievedChunk]:
+        search_calls.append((question, document_scope))
+        return [retrieved]
+
+    monkeypatch.setattr(
+        Neo4jDatabase,
+        "from_env",
+        classmethod(lambda cls: database),
+    )
+    monkeypatch.setattr(vector_search, "load_embedding_model", lambda: object())
+    monkeypatch.setattr(
+        OllamaClient,
+        "from_env",
+        classmethod(lambda cls: llm),
+    )
+    monkeypatch.setattr(GraphSearch, "people_mentioned_in", fake_people)
+    monkeypatch.setattr(GraphSearch, "reporting_chain", fake_reporting_chain)
+    monkeypatch.setattr(SearchClauseVectorSearch, "search", fake_search)
+    app = AppTest.from_file(APP_PATH, default_timeout=10).run()
+    app.selectbox[0].set_value("GraphRAG").run()
+    app.selectbox[1].set_value("Somente pessoas").run()
+    assert not app.date_input
+    app.checkbox[0].check().run()
+    app.chat_input[0].set_value(
+        "Quais são os subordinados de Gerente de Tecnologia?"
+    ).run()
+
+    assert not app.exception
+    assert graph_calls == [("E-007", expected_as_of)]
+    assert search_calls == [
+        (
+            "Quais são os subordinados de Gerente de Tecnologia?",
+            "PESSOA",
+        ),
+    ]
+    assert app.session_state.graphrag_status == "answered"
+    assert app.session_state.graphrag_paths == graph_result.paths
+    assert app.session_state.graphrag_result_as_of == expected_as_of
+    assert any("DOC-058_chunk_002" in item.value for item in app.markdown)
+    assert any("REL-15-07" in item.value for item in app.caption)
 
 
 def test_direct_conversation_can_be_resumed_and_deleted(

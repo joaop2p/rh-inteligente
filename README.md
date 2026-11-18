@@ -2,7 +2,7 @@
 
 Aplicação monolítica em Python e Streamlit para consultas de Recursos Humanos, com Neo4j como base de conhecimento em modelo LPG (*Labeled Property Graph*) e previsão de fluxos **RAG, GraphRAG e KAG**.
 
-> **Estado do projeto:** os scripts de ingestão do cadastro mestre, relações, metadados documentais, chunks e embeddings foram executados no Neo4j. A recuperação híbrida e o pipeline RAG com proveniência estão conectados ao modo RAG do Streamlit, com exibição das fontes. Conversas diretas e RAG podem ser salvas localmente em arquivos Markdown criptografados; GraphRAG, KAG e visualização de caminhos continuam pendentes.
+> **Estado do projeto:** os scripts de ingestão do cadastro mestre, relações, metadados documentais, chunks e embeddings foram executados no Neo4j. A recuperação híbrida e o pipeline RAG com proveniência estão conectados ao modo RAG do Streamlit. Um GraphRAG limitado a perguntas hierárquicas com pessoa canônica explícita ou cargo CEO canônico combina travessia temporal, busca vetorial/full-text e chunks com proveniência. Há também um baseline Text-to-Graph determinístico. Conversas diretas e RAG podem ser salvas localmente em arquivos Markdown criptografados; KAG, visualização interativa do subgrafo e validação live do novo fluxo GraphRAG continuam pendentes.
 
 ## 1. Objetivo
 
@@ -13,9 +13,9 @@ Permitir que usuários façam perguntas sobre a estrutura organizacional e os do
 ### Escopo da aplicação
 - Ingerir documentos TXT (e, futuramente, PDF/DOCX, se necessário).
 - Extrair texto, dividir em chunks e gerar embeddings.
-- Extrair entidades e relações (NER/RE) e resolver nomes para IDs canônicos.
+- Extrair menções exatas a nomes canônicos e ligá-las aos chunks; NER/RE semântico e resolução de aliases continuam pendentes.
 - Persistir entidades, relacionamentos, documentos e chunks no Neo4j.
-- Executar RAG vetorial, GraphRAG com Cypher e travessias multi-hop.
+- Executar RAG vetorial e uma travessia GraphSearch hierárquica multi-hop com Cypher allowlisted.
 - Combinar evidências documentais e estruturais para o fluxo KAG.
 - Exibir resposta, fontes, subgrafo, consulta Cypher e sinais observáveis de recuperação.
 
@@ -159,7 +159,7 @@ A pergunta deve ser ajustada aos dados efetivamente presentes. Se o dataset não
     {
       "doc_id": "DOC-...",
       "chunk_id": "CHUNK-...",
-      "quote": "Trecho que sustenta a resposta"
+      "text": "Texto completo do chunk recuperado e citado"
     }
   ],
   "graph": {
@@ -181,7 +181,7 @@ A pergunta deve ser ajustada aos dados efetivamente presentes. Se o dataset não
 
 | Componente | Diretriz atual |
 |---|---|
-| Banco de grafos | Neo4j 5.26+ |
+| Banco de grafos | Neo4j 5.26+ (procedures clássicas); `SEARCH` é usado quando suportado |
 | Modelo de dados | LPG |
 | Índices | Unicidade, full-text de chunks e vetor de embeddings; demais índices conforme demanda |
 | Embeddings | BAAI/bge-m3, dimensão 1024 (usado e validado na ingestão executada) |
@@ -198,7 +198,7 @@ Para preparar uma instalação nova:
 1. Clonar o repositório.
 2. Criar e ativar ambiente virtual Python.
 3. Instalar dependências: `pip install -r requirements.txt`.
-4. Copiar `.env.exemple` para `.env` e configurar as variáveis locais; nunca versionar segredos. Para persistir conversas, gere uma chave Fernet e preencha `RH_CONVERSATION_ENCRYPTION_KEY`:
+4. Copiar `.env.exemple` para `.env` e configurar as variáveis locais; nunca versionar segredos. A variável de criptografia vazia no exemplo é intencional: para persistir conversas, gere uma chave Fernet e coloque o valor somente em `RH_CONVERSATION_ENCRYPTION_KEY` no `.env` local:
 
    ```bash
    .venv/bin/python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'
@@ -221,17 +221,63 @@ Com o Ollama acessível via Tailscale e `TAILSCALE_MODEL_HOST` configurado no `.
 
 O chat mantém conversas diretas e RAG separadas, oferece retomada/exclusão pelo painel e temas claro/escuro. As conversas são gravadas como Markdown UTF-8 criptografado com Fernet em `.tmp/conversations/`, com UUID no nome e permissões locais restritas. A interface expurga conversas cuja última atividade passou de 30 dias sempre que executa; se o aplicativo estiver fechado, o expurgo ocorre na próxima execução. A chave fica em `RH_CONVERSATION_ENCRYPTION_KEY` no `.env`, que não deve ser compartilhado nem versionado. A criptografia protege os arquivos sem a chave, mas não contra alguém com acesso à conta local e ao `.env`. Se a chave não estiver configurada, o aplicativo informa que a persistência está indisponível e mantém o chat apenas na sessão atual.
 
-Em **Conversa direta**, as mensagens são enviadas ao Ollama, sem consultar documentos ou Neo4j; respostas sobre o dataset não são fundamentadas. **RAG** consulta os índices Neo4j, envia a pergunta, `doc_id`/`chunk_id` e trechos recuperados ao Ollama configurado via Tailscale e mostra as citações documentais. É necessário marcar a autorização explícita no painel; escolha o escopo documental, use apenas dados saneados e confirme a autorização para o escopo `PESSOA`. O histórico RAG é exibido, mas não é enviado como evidência ao modelo. **GraphRAG** e **KAG** continuam indisponíveis, assim como a visualização de caminhos.
+Em **Conversa direta**, as mensagens são enviadas ao Ollama, sem consultar documentos ou Neo4j; respostas sobre o dataset não são fundamentadas. **RAG** consulta os índices Neo4j e mostra as citações documentais. **GraphRAG** atende somente perguntas hierárquicas suportadas, combina caminho temporal com chunks recuperados e exibe evidências; ambos enviam pergunta, IDs e trechos ao Ollama via Tailscale após consentimento explícito. Use dados saneados e confirme autorização, especialmente no escopo `PESSOA`. O histórico GraphRAG não é persistido. **KAG** e visualização interativa do subgrafo continuam indisponíveis.
 
 O acesso ao Neo4j está encapsulado em `src/database/neo4j.py`, com transações de leitura/escrita e parâmetros Cypher separados da consulta. A geração em `src/generation/llm.py` usa a API nativa de chat do Ollama no host indicado por `TAILSCALE_MODEL_HOST` (URL ou host/porta, normalmente com a porta padrão do Ollama). Se houver exatamente um modelo instalado, ele é selecionado automaticamente. Com mais de um modelo, informe `model_name` ao criar `OllamaClient`.
+
+### Baseline Text-to-Graph
+
+`src/graph/text_to_graph.py` compara os nomes canônicos existentes em `Pessoa`, `Organizacao`, `Departamento` e `Cargo` com os textos de `Chunk`. Ao encontrar um nome completo (ignorando apenas maiúsculas/minúsculas e permitindo espaços/quebras de linha entre partes), produz uma relação `Chunk-[:MENCIONA]->Entidade` com o trecho literal e os offsets no chunk. Nomes iguais associados a mais de um ID ou label são tratados como ambíguos e não geram relação.
+
+Execute primeiro em modo de simulação:
+
+```bash
+.venv/bin/python -m src.graph.text_to_graph
+```
+
+Para persistir as relações determinísticas:
+
+```bash
+.venv/bin/python -m src.graph.text_to_graph --apply
+```
+
+O modo padrão não altera o banco. `--apply` cria ou atualiza somente relações `MENCIONA`, usando queries Cypher fixas e parâmetros; não cria entidades, aliases ou relações organizacionais. O baseline não usa fuzzy matching, não infere relações semânticas e não gera score de confiança. Portanto, não equivale à extração geral NER/RE descrita no Projeto Final; aliases e entidades não catalogadas seguem sem resolução.
+
+### GraphSearch hierárquico multi-hop
+
+`src/retrieval/graph_search.py` oferece uma consulta backend para percorrer `REPORTS_TO` no sentido subordinado → gestor, com limite fixo de cinco saltos. A validade usa os intervalos inclusivos documentados (`valid_from <= as_of <= valid_to`, ou sem fim quando `valid_to` é nulo). A resolução por nome é exata, sem fuzzy matching; se o nome for ambíguo, a busca exige o ID canônico. O cargo CEO também pode ser resolvido somente por correspondência exata com `Cargo.cargo_canonico` igual a `CEO` ou `Chief Executive Officer`, considerando as validades de `OCUPA_CARGO` e do vínculo `EMPREGADO_DE` com a organização canônica `ORG-001`. A consulta é uma constante Cypher parametrizada, nunca texto produzido pelo LLM.
+
+```python
+from datetime import date
+
+from src.database.neo4j import Neo4jDatabase
+from src.retrieval.graph_search import GraphSearch
+
+with Neo4jDatabase.from_env() as graph:
+    search = GraphSearch(graph)
+    manager = search.resolve_person_name("Nome canônico do gestor")
+    if manager is not None:
+        result = search.reporting_chain(
+            manager.funcionario_id,
+            as_of=date(2025, 1, 1),
+        )
+        print(result.paths)
+        print(result.evidence)
+```
+
+O modo GraphRAG da interface combina esse caminho com resultados vetoriais/full-text e chunks `MENCIONA`, deduplicados por `doc_id`/`chunk_id`. A busca de chunks no grafo e nos índices respeita o mesmo escopo documental escolhido (`Documento.escopo`). A resposta cita somente chunks recuperados; o caminho, IDs e direção das relações temporais e referências de origem ficam expostos ao lado da resposta. O modo aceita perguntas hierárquicas contendo exatamente um nome canônico completo ou o cargo CEO com uma atribuição temporal única para `CEO`/`Chief Executive Officer`, vinculada à organização `ORG-001` por `EMPREGADO_DE`; cargos ausentes ou ambíguos resultam em insuficiência sem chamada ao LLM. Para pedidos pelos três subordinados mais próximos, retorna no máximo três pessoas com menor distância em `REPORTS_TO`, desempata pelo nome sem distinção entre maiúsculas/minúsculas e pelo ID canônico. A referência temporal usa a data atual, sem seletor na interface. A consulta é Cypher fixa/parametrizada, nunca gerada pelo modelo.
+
+Esse fluxo é limitado ao caso hierárquico e ainda não foi executado contra Neo4j real. A conversa GraphRAG permanece apenas na sessão atual, sem persistência no armazenamento criptografado. KAG, algoritmos como PageRank/Leiden, visualização interativa do subgrafo, aliases e NER/RE semântico continuam pendentes.
 
 ### Recuperação híbrida inicial e pipeline RAG
 
 `src/retrieval/vector_search.py` consulta os índices Neo4j `chunk_embedding` e `chunk_fulltext` e combina as listas por Reciprocal Rank Fusion (RRF). Não compara diretamente score vetorial e score lexical. `RetrievedChunk.score` é a similaridade vetorial (ou `None` se o resultado veio somente da busca lexical); `fulltext_score` é o score lexical bruto; `rank_score` é o sinal usado para ordenar a fusão. Nenhum desses valores representa confiança.
 
-`VectorSearch.search` aceita `document_scope="ORGANIZACAO"` ou `"PESSOA"` para restringir explicitamente a busca ao escopo dos metadados documentais. O escopo não é inferido da pergunta. A busca consulta até 250 candidatos por índice antes de filtrar/fundir, conforme o limite do protótipo. Uma recuperação com candidatos não prova que exista evidência suficiente: não há limiar validado nem detecção semântica determinística de suporte.
+`VectorSearch.search` aceita `document_scope="ORGANIZACAO"` ou `"PESSOA"` para restringir explicitamente a busca ao escopo dos metadados documentais. O escopo não é inferido da pergunta. `min_vector_score` é um filtro opcional aplicado às pontuações vetoriais depois da fusão e antes de limitar a lista a `top_k`. Quando configurado, chunks com `score` abaixo do limiar são removidos; candidatos exclusivamente lexicais (`score is None`) são mantidos, pois não têm score vetorial comparável. A constante `RAG_MIN_VECTOR_SCORE`, em `src/rag/pipeline.py`, controla o valor padrão do pipeline e permanece `None` até uma calibração com a integração real. Portanto, por padrão a busca mantém o comportamento anterior, sem filtro.
 
-`VectorSearch` mantém as procedures `db.index.vector.queryNodes` e `db.index.fulltext.queryNodes` para compatibilidade com instalações anteriores. `SearchClauseVectorSearch` oferece o caminho paralelo com a cláusula Cypher 25 `SEARCH`, sem esses avisos de depreciação. A documentação oficial declara suporte a busca vetorial por `SEARCH` desde Neo4j 2026.01 e full-text desde 2026.09; teste a disponibilidade na sua instância antes de selecionar essa classe.
+Para calibrar, execute os testes de integração com Neo4j e BGE-M3 reais, registre `RetrievedChunk.score` dos chunks-alvo nas dez perguntas revisadas e compare-os com resultados de perguntas fora do domínio. Escolha um limiar somente após avaliar quantos alvos relevantes ele manteria e quantos resultados irrelevantes excluiria; documente os falsos positivos e negativos. Se a integração real não estiver disponível, mantenha `RAG_MIN_VECTOR_SCORE = None` em vez de assumir um valor. Similaridade vetorial, score full-text e RRF são sinais de recuperação, **não scores de confiança**.
+
+`answer_with_rag` tenta primeiro `SearchClauseVectorSearch`, que usa a cláusula Cypher 25 `SEARCH`. Se o Neo4j retornar `CypherSyntaxError`, o app registra o fallback e repete a busca com `VectorSearch`, que usa as procedures clássicas `db.index.vector.queryNodes` e `db.index.fulltext.queryNodes`. Outros erros do Neo4j não são tratados como falta de suporte e continuam visíveis. O caminho de procedures é a compatibilidade mínima documentada para Neo4j 5.26+; `SEARCH` é uma otimização opcional. A documentação oficial declara suporte vetorial por `SEARCH` a partir do Neo4j 2026.01 e full-text a partir do 2026.09. Embora tenha funcionado na instância Aura 5.27 verificada, isso não garante disponibilidade em outras instâncias.
 
 Exemplo de uso:
 
@@ -256,9 +302,9 @@ with Neo4jDatabase.from_env() as graph:
         )
 ```
 
-`src/rag/pipeline.py` usa os resultados como candidatos documentais e solicita ao Ollama JSON com status, resposta e citações. A instrução restringe o modelo a RH da NovaTech e às evidências daquela pergunta; o histórico de conversa não é enviado como prova. Respostas citadas são aceitas somente se os pares `doc_id`/`chunk_id` existirem entre os trechos recuperados. Sem resultados, o LLM não é chamado; se o modelo marcar insuficiência, o pipeline retorna a mensagem fixa sem fontes.
+`src/rag/pipeline.py` usa os resultados como candidatos documentais e solicita ao Ollama JSON com status, resposta e citações. Se o filtro configurado não deixar chunks, o pipeline retorna insuficiência sem chamar o LLM. A instrução restringe o modelo a RH da NovaTech e às evidências daquela pergunta; o histórico de conversa não é enviado como prova. Respostas citadas são aceitas somente se os pares `doc_id`/`chunk_id` existirem entre os trechos recuperados. `RAGSource.text` é o texto completo do chunk citado, não uma frase extraída ou validada como citação literal. Sem resultados, o LLM não é chamado; se o modelo marcar insuficiência, o pipeline retorna a mensagem fixa sem fontes.
 
-Isso não garante, por si só, a validade semântica da resposta: o modelo ainda pode classificar incorretamente um trecho como suficiente. A interface RAG já está conectada, mas a qualidade da relevância e a insuficiência semântica ainda precisam de avaliação mais abrangente. A busca híbrida documental não substitui o GraphRAG: consultas Cypher estruturadas, multi-hop e KAG continuam pendentes.
+Isso não garante, por si só, a validade semântica da resposta: o modelo ainda pode classificar incorretamente um trecho como suficiente. A qualidade da relevância e a insuficiência semântica ainda precisam de avaliação mais abrangente. O fluxo GraphRAG atual cobre somente a hierarquia por `REPORTS_TO`; outras consultas estruturadas, KAG, algoritmos de grafo e visualização interativa continuam pendentes.
 
 Para testar a busca contra o Neo4j configurado e o modelo BGE-M3 real, com os dados saneados já carregados:
 
@@ -379,6 +425,7 @@ Esta é uma estrutura-alvo, não uma afirmação de que todos os diretórios já
 
 - [ ] Schema versionado executado sem erros; constraints e índices validados no Neo4j.
 - [x] Nós e relações do dataset são carregados com IDs canônicos.
+- [x] Baseline Text-to-Graph cria relações `MENCIONA` somente para correspondências exatas e não ambíguas com nomes canônicos.
 - [x] Datas e propriedades temporais dos vínculos foram validadas e importadas.
 - [x] Documentos são associados a chunks com referência ao arquivo de origem.
 - [x] Embeddings são gerados pelo mesmo modelo e dimensão configurados no índice.
