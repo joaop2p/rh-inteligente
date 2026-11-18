@@ -18,6 +18,7 @@ from src.generation.llm import ChatMessage, LLMRequestError, OllamaClient
 from src.persistence.conversations import (
     ConversationStore,
     ConversationStoreConfigurationError,
+    StoredSource,
 )
 from src.retrieval.vector_search import (
     RetrievedChunk,
@@ -662,3 +663,9 @@ def test_theme_selection_and_llm_error_are_visible(
     app.chat_input[0].set_value("Teste").run()
     assert any("Servidor indisponível" in error.value for error in app.error)
     assert app.session_state.messages == []
+
+
+def test_source_text_supports_restored_history_sources() -> None:
+    restored = StoredSource("DOC-1", "CHUNK-1", "Trecho salvo", 0.5, None, 0.1)
+
+    assert app_module.source_text(restored) == "Trecho salvo"

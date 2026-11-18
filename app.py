@@ -208,6 +208,12 @@ def restore_conversation(mode: str, saved: Conversation) -> None:
         )
 
 
+def source_text(source: object) -> str:
+    """Fontes novas expõem `text`; as restauradas do histórico usam `quote`."""
+    text = getattr(source, "text", None)
+    return text if isinstance(text, str) else str(getattr(source, "quote", ""))
+
+
 def apply_theme(theme: str) -> None:
     colors = THEMES[theme]
     st.markdown(
@@ -796,7 +802,7 @@ def main() -> None:
                     with st.container(border=True):
                         st.markdown(f"**{source.doc_id} · {source.chunk_id}**")
                         st.caption("Chunk recuperado completo")
-                        st.write(source.text)
+                        st.write(source_text(source))
                         with st.expander("Sinais de recuperação"):
                             st.write(f"Similaridade vetorial: {source.vector_score}")
                             st.write(f"Score full-text: {source.fulltext_score}")
@@ -817,11 +823,16 @@ def main() -> None:
                         st.caption(
                             "Origem: " + ", ".join(source.origins)
                         )
-                        st.write(source.text)
+                        st.write(source_text(source))
                         with st.expander("Sinais de recuperação"):
                             st.write(f"Similaridade vetorial: {source.vector_score}")
                             st.write(f"Score full-text: {source.fulltext_score}")
                             st.write(f"RRF rank score: {source.rank_score}")
+            elif st.session_state.graphrag_status == "answered":
+                st.info(
+                    "Resposta sustentada pelo caminho do grafo; o escopo "
+                    "documental selecionado não expôs chunks de apoio."
+                )
             elif st.session_state.graphrag_status == "insufficient":
                 st.info(
                     "A resposta GraphRAG mais recente não citou chunks documentais."
