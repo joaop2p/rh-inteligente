@@ -327,6 +327,61 @@ def test_kag_prefers_rescission_document_over_contract_for_desligamentos() -> No
     assert "Juliana Barbosa Reis" not in response.answer
 
 
+def test_graphrag_answers_direct_subordinates_deterministically() -> None:
+    graph_result = _graph_result(
+        paths=(
+            GraphPath(
+                people=(
+                    GraphPerson("E-006", "Fernando Gomes Bastos"),
+                    GraphPerson("E-002", "Marcos Vinícius Tavares"),
+                ),
+                relationships=(
+                    GraphRelationship(
+                        relacao_id="REL-006-002",
+                        source_id="E-006",
+                        target_id="E-002",
+                        valid_from=date(2024, 1, 1),
+                        valid_to=None,
+                        source_references=("DOC-006",),
+                    ),
+                ),
+            ),
+            GraphPath(
+                people=(
+                    GraphPerson("E-007", "Camila Rocha Medeiros"),
+                    GraphPerson("E-002", "Marcos Vinícius Tavares"),
+                ),
+                relationships=(
+                    GraphRelationship(
+                        relacao_id="REL-007-002",
+                        source_id="E-007",
+                        target_id="E-002",
+                        valid_from=date(2024, 1, 1),
+                        valid_to=None,
+                        source_references=("DOC-007",),
+                    ),
+                ),
+            ),
+        )
+    )
+    graph_search = FakeGraphSearch(
+        (GraphPerson("E-002", "Marcos Vinícius Tavares"),),
+        graph_result,
+    )
+    llm = FakeLLM()
+
+    response = GraphRAGPipeline(FakeSearch([]), graph_search, llm).answer(
+        "Quais são os subordinados diretos de Marcos Vinícius Tavares?",
+        as_of=date(2025, 1, 1),
+        document_scope="ORGANIZACAO",
+    )
+
+    assert response.status == "answered"
+    assert "Fernando Gomes Bastos" in response.answer
+    assert "Camila Rocha Medeiros" in response.answer
+    assert llm.messages is None
+
+
 def test_pipeline_fuses_graph_and_vector_chunks_and_validates_citations() -> None:
     chunk_text = "  Chunk ligado à pessoa do caminho."
     graph_result = _graph_result(
@@ -376,11 +431,8 @@ def test_pipeline_fuses_graph_and_vector_chunks_and_validates_citations() -> Non
             None,
         )
     ]
-    assert llm.messages is not None
-    prompt = llm.messages[1]["content"]
-    assert "REL-2-1" in prompt
-    assert "DOC-HIER-1" in prompt
-    assert "CHUNK-1" in prompt
+    assert llm.messages is None
+    assert "Pessoa subordinada" in response.answer
 
 
 def test_pipeline_rejects_unsupported_intent_without_search_or_generation() -> None:
@@ -464,8 +516,8 @@ def test_pipeline_resolves_ceo_and_limits_to_three_nearest_subordinates() -> Non
     ]
     assert "OCUPA_CARGO" in response.cypher
     assert "REPORTS_TO*1..5" in response.cypher
-    assert llm.messages is not None
-    assert '"cargo_canonico": ["CEO"]' in llm.messages[1]["content"]
+    assert llm.messages is None
+    assert "Ana Silva" in response.answer
 
 
 def test_pipeline_truncates_and_ranks_nearest_three_paths_from_backend() -> None:
@@ -512,13 +564,14 @@ def test_pipeline_truncates_and_ranks_nearest_three_paths_from_backend() -> None
         path.people[0].funcionario_id
         for path in response.paths
     ] == ["E-002", "E-004", "E-003"]
-    assert llm.messages is not None
-    prompt = llm.messages[1]["content"]
-    assert "CHUNK-E-002" in prompt
-    assert "CHUNK-E-003" in prompt
-    assert "CHUNK-E-004" in prompt
-    assert "E-005" not in prompt
-    assert [source.chunk_id for source in response.sources] == ["CHUNK-E-002"]
+    assert llm.messages is None
+    assert "ana" in response.answer
+    assert "Zoe" in response.answer
+    assert "Bruno" in response.answer
+    assert {
+        source.chunk_id
+        for source in response.sources
+    } == {"CHUNK-E-002", "CHUNK-E-003", "CHUNK-E-004"}
 
 
 @pytest.mark.parametrize(
@@ -623,7 +676,7 @@ def test_pipeline_filters_low_vector_scores_before_generation() -> None:
     assert llm.messages is None
 
 
-def test_pipeline_rejects_citations_not_present_in_retrieved_chunks() -> None:
+def test_pipeline_ignores_untrusted_llm_citation_for_hierarchy() -> None:
     llm = FakeLLM(
         {
             "status": "answered",
@@ -640,14 +693,17 @@ def test_pipeline_rejects_citations_not_present_in_retrieved_chunks() -> None:
         llm,
     )
 
-    with pytest.raises(GraphRAGResponseError, match="não foi recuperado"):
-        pipeline.answer(
-            "Quais são os subordinados de Ana Silva?",
-            as_of=date(2025, 1, 1),
-        )
+    response = pipeline.answer(
+        "Quais são os subordinados de Ana Silva?",
+        as_of=date(2025, 1, 1),
+    )
+
+    assert response.status == "answered"
+    assert "Pessoa subordinada" in response.answer
+    assert llm.messages is None
 
 
-def test_pipeline_preserves_graph_only_paths_when_llm_returns_insufficient() -> None:
+def test_pipeline_preserves_graph_answer_when_llm_returns_insufficient() -> None:
     graph_result = _graph_result()
     llm = FakeLLM({"status": "insufficient", "citations": []})
     pipeline = GraphRAGPipeline(
@@ -664,9 +720,10 @@ def test_pipeline_preserves_graph_only_paths_when_llm_returns_insufficient() -> 
         as_of=date(2025, 1, 1),
     )
 
-    assert response.status == "insufficient"
-    assert response.sources == []
+    assert response.status == "answered"
+    assert response.sources
     assert response.paths == graph_result.paths
+    assert "Pessoa subordinada" in response.answer
 
 
 def test_pipeline_rejects_inconsistent_text_for_same_chunk() -> None:

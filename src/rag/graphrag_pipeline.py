@@ -251,6 +251,108 @@ class GraphRAGPipeline:
                 cypher=graph_result.cypher,
             )
 
+        direct_only = bool(
+            re.search(
+                r"\bdireto(s)?\b",
+                unicodedata.normalize("NFKD", normalized_question.casefold()),
+            )
+        )
+        relevant_paths = tuple(
+            path
+            for path in graph_result.paths
+            if not direct_only or len(path.relationships) == 1
+        )
+        if relevant_paths:
+            managers = {
+                person.funcionario_id: person.nome
+                for path in relevant_paths
+                for person in path.people
+                if person.funcionario_id == manager.funcionario_id
+            }
+            subordinates: list[str] = []
+            seen_subordinates: set[str] = set()
+            for path in sorted(
+                relevant_paths,
+                key=lambda item: (
+                    len(item.relationships),
+                    item.people[0].nome.casefold(),
+                    item.people[0].funcionario_id,
+                ),
+            ):
+                subordinate = path.people[0]
+                if subordinate.funcionario_id not in seen_subordinates:
+                    seen_subordinates.add(subordinate.funcionario_id)
+                    subordinates.append(subordinate.nome)
+
+            if subordinates:
+                manager_name = managers.get(
+                    manager.funcionario_id,
+                    manager.nome,
+                )
+                answer = (
+                    f"Os subordinados diretos de {manager_name} são "
+                    + ", ".join(subordinates)
+                    + "."
+                    if direct_only
+                    else f"Os subordinados de {manager_name} são "
+                    + ", ".join(subordinates)
+                    + "."
+                )
+                deterministic_payload = {
+                    "status": "answered",
+                    "answer": answer,
+                    "citations": [
+                        {
+                            "doc_id": source.doc_id,
+                            "chunk_id": source.chunk_id,
+                        }
+                        for source in sources
+                    ],
+                }
+                return self._build_response(
+                    deterministic_payload,
+                    sources,
+                    replace(graph_result, paths=relevant_paths),
+                    as_of,
+                    knowledge_package={
+                        "as_of": as_of.isoformat(),
+                        "facts": [
+                            {
+                                "funcionario_id": person.funcionario_id,
+                                "nome": person.nome,
+                                "relationship_type": "REPORTS_TO",
+                            }
+                            for path in relevant_paths
+                            for person in path.people
+                        ],
+                        "relationships": [
+                            {
+                                "type": "REPORTS_TO",
+                                "relacao_id": relationship.relacao_id,
+                                "source_id": relationship.source_id,
+                                "target_id": relationship.target_id,
+                                "valid_from": relationship.valid_from.isoformat(),
+                                "valid_to": (
+                                    relationship.valid_to.isoformat()
+                                    if relationship.valid_to is not None
+                                    else None
+                                ),
+                            }
+                            for path in relevant_paths
+                            for relationship in path.relationships
+                        ],
+                        "document_chunks": [
+                            {
+                                "doc_id": source.doc_id,
+                                "chunk_id": source.chunk_id,
+                                "text": source.text,
+                                "origins": list(source.origins),
+                            }
+                            for source in sources
+                        ],
+                    },
+                )
+
         evidence = {
             "as_of": as_of.isoformat(),
             "facts": [
