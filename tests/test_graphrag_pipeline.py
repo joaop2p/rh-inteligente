@@ -55,6 +55,8 @@ class FakeGraphSearch:
         self.role_calls: list[tuple[tuple[str, ...], str, date]] = []
         self.reporting_calls: list[tuple[str, date, str | None, int]] = []
         self.document_evidence = document_evidence
+        self.upward_calls: list[str] = []
+        self.path_calls: list[tuple[str, str]] = []
 
     def people_mentioned_in(self, text: str) -> tuple[GraphPerson, ...]:
         self.people_calls.append(text)
@@ -88,6 +90,44 @@ class FakeGraphSearch:
     ) -> GraphSearchResult:
         self.reporting_calls.append((manager_id, as_of, document_scope, max_paths))
         return self.result
+
+    def management_chain(
+        self,
+        person_id: str,
+        *,
+        as_of: date,
+        document_scope: str | None = None,
+    ) -> GraphSearchResult:
+        self.upward_calls.append(person_id)
+        return self.result
+
+    def shortest_path(
+        self,
+        start_id: str,
+        end_id: str,
+        *,
+        as_of: date,
+        document_scope: str | None = None,
+    ) -> GraphSearchResult:
+        self.path_calls.append((start_id, end_id))
+        return self.result
+
+    def cargo_evidence(
+        self,
+        person_id: str,
+        cargo_titles: tuple[str, ...],
+        *,
+        as_of: date,
+        document_scope: str | None = None,
+    ) -> tuple[GraphEvidence, ...]:
+        return (
+            GraphEvidence(
+                doc_id="DOC-CARGO",
+                chunk_id="CHUNK-CARGO",
+                text="Contrato do CEO.",
+                funcionario_id=person_id,
+            ),
+        )
 
 
 class FakeLLM:
@@ -219,7 +259,7 @@ def test_kag_answers_basic_document_questions_when_graph_intent_is_absent() -> N
         "CHUNK-FERIAS"
     )
     assert search.calls == [
-        ("Qual é a política de férias?", 12, None, None)
+        ("Qual é a política de férias?", 12, "ORGANIZACAO", None)
     ]
 
 
@@ -571,7 +611,7 @@ def test_pipeline_truncates_and_ranks_nearest_three_paths_from_backend() -> None
     assert {
         source.chunk_id
         for source in response.sources
-    } == {"CHUNK-E-002", "CHUNK-E-003", "CHUNK-E-004"}
+    } == {"CHUNK-E-002", "CHUNK-E-003", "CHUNK-E-004", "CHUNK-CARGO"}
 
 
 @pytest.mark.parametrize(
@@ -750,3 +790,121 @@ def test_pipeline_rejects_inconsistent_text_for_same_chunk() -> None:
             "Quais são os subordinados de Ana Silva?",
             as_of=date(2025, 1, 1),
         )
+
+
+def test_graphrag_answers_direct_manager_with_upward_chain_and_graph_citations() -> None:
+    graph_search = FakeGraphSearch(
+        (GraphPerson("E-002", "Pessoa subordinada"),),
+        _graph_result(),
+    )
+    llm = FakeLLM()
+    search = FakeSearch(
+        [RetrievedChunk("OUTRO", "DOC-X", "Texto vetorial irrelevante", 0.9, 0.1, None)]
+    )
+
+    response = GraphRAGPipeline(search, graph_search, llm).answer(
+        "Quem é o gestor direto de Pessoa subordinada?",
+        as_of=date(2025, 1, 1),
+    )
+
+    assert response.status == "answered"
+    assert "gestor direto de Pessoa subordinada é Ana Silva" in response.answer
+    assert graph_search.upward_calls == ["E-002"]
+    assert [(s.doc_id, s.chunk_id) for s in response.sources] == [("DOC-1", "CHUNK-1")]
+    assert response.paths and llm.messages is None
+
+
+def test_graphrag_resolves_shortest_path_between_person_and_ceo() -> None:
+    graph_search = FakeGraphSearch(
+        (GraphPerson("E-002", "Pessoa subordinada"),),
+        _graph_result(),
+        role_people=(
+            GraphCargoOccupant(GraphPerson("E-001", "Ana Silva"), ("CEO",)),
+        ),
+    )
+
+    response = GraphRAGPipeline(FakeSearch([]), graph_search, FakeLLM()).answer(
+        "Qual a cadeia hierárquica entre Pessoa subordinada e o CEO?",
+        as_of=date(2025, 1, 1),
+    )
+
+    assert response.status == "answered"
+    assert graph_search.path_calls == [("E-002", "E-001")]
+    assert "1 salto(s)" in response.answer
+    assert "Pessoa subordinada reporta a Ana Silva" in response.answer
+    assert {s.doc_id for s in response.sources} >= {"DOC-1", "DOC-CARGO"}
+
+
+def test_graphrag_answers_who_is_ceo_from_cargo_evidence() -> None:
+    graph_search = FakeGraphSearch(
+        (),
+        _graph_result(),
+        role_people=(
+            GraphCargoOccupant(GraphPerson("E-001", "Ana Silva"), ("CEO",)),
+        ),
+    )
+
+    response = GraphRAGPipeline(FakeSearch([]), graph_search, FakeLLM()).answer(
+        "Quem é o CEO?",
+        as_of=date(2025, 1, 1),
+    )
+
+    assert response.status == "answered"
+    assert "Ana Silva ocupa o cargo de CEO" in response.answer
+    assert [s.chunk_id for s in response.sources] == ["CHUNK-CARGO"]
+    assert graph_search.reporting_calls == []
+
+
+def test_graphrag_ceo_with_direct_subordinates_names_role_holder_and_cites_graph() -> None:
+    graph_search = FakeGraphSearch(
+        (),
+        _graph_result(),
+        role_people=(
+            GraphCargoOccupant(GraphPerson("E-001", "Ana Silva"), ("CEO",)),
+        ),
+    )
+    search = FakeSearch(
+        [RetrievedChunk("OUTRO", "DOC-X", "Texto vetorial irrelevante", 0.9, 0.1, None)]
+    )
+
+    response = GraphRAGPipeline(search, graph_search, FakeLLM()).answer(
+        "Quem é o CEO e quais são seus subordinados diretos?",
+        as_of=date(2025, 1, 1),
+    )
+
+    assert response.status == "answered"
+    assert response.answer.startswith("Ana Silva ocupa o cargo de CEO")
+    assert "Pessoa subordinada" in response.answer
+    assert {s.doc_id for s in response.sources} == {"DOC-1", "DOC-CARGO"}
+
+
+def test_graphrag_answers_from_path_when_scope_hides_source_chunks() -> None:
+    graph_search = FakeGraphSearch(
+        (GraphPerson("E-002", "Pessoa subordinada"),),
+        _graph_result(evidence=()),
+    )
+
+    response = GraphRAGPipeline(FakeSearch([]), graph_search, FakeLLM()).answer(
+        "Quem é o gestor direto de Pessoa subordinada?",
+        as_of=date(2025, 1, 1),
+        document_scope="ORGANIZACAO",
+    )
+
+    assert response.status == "answered"
+    assert response.sources == []
+    assert response.paths
+
+
+def test_graphrag_does_not_treat_generic_between_as_path_request() -> None:
+    graph_search = FakeGraphSearch(
+        (GraphPerson("E-001", "Ana Silva"), GraphPerson("E-002", "Bruno Lima")),
+        _graph_result(),
+    )
+
+    response = GraphRAGPipeline(FakeSearch([]), graph_search, FakeLLM()).answer(
+        "Quem é o gestor de Ana Silva e Bruno Lima entre 2023 e 2024?",
+        as_of=date(2025, 1, 1),
+    )
+
+    assert graph_search.path_calls == []
+    assert response.status == "insufficient"

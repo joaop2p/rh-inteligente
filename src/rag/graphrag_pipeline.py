@@ -14,9 +14,11 @@ from typing import Any, Literal, Protocol
 from src.generation.llm import ChatMessage
 from src.rag.pipeline import INSUFFICIENT_EVIDENCE_ANSWER, RAG_MIN_VECTOR_SCORE
 from src.retrieval.graph_search import (
+    CARGO_EVIDENCE_QUERY,
     CARGO_OCCUPANTS_QUERY,
     MAX_PATHS,
     GraphCargoOccupant,
+    GraphEvidence,
     GraphPath,
     GraphPerson,
     GraphSearchResult,
@@ -36,6 +38,24 @@ _REPORTING_INTENT_TERMS = (
     "lidera",
     "liderados",
     "lideradas",
+)
+
+_UPWARD_INTENT_TERMS = (
+    "gestor",
+    "gestora",
+    "chefe",
+    "superior",
+    "a quem",
+    "cadeia hierarquica",
+    "hierarquia acima",
+)
+_CONNECTION_INTENT_TERMS = (
+    "cadeia",
+    "caminho",
+    "conecta",
+    "conexao",
+    "ligacao",
+    "relacao entre",
 )
 
 _CEO_CARGO_TITLES = ("CEO", "Chief Executive Officer")
@@ -100,6 +120,32 @@ class GraphSearchBackend(Protocol):
         max_paths: int = 100,
         document_scope: str | None = None,
     ) -> GraphSearchResult: ...
+
+    def management_chain(
+        self,
+        person_id: str,
+        *,
+        as_of: date,
+        document_scope: str | None = None,
+    ) -> GraphSearchResult: ...
+
+    def shortest_path(
+        self,
+        start_id: str,
+        end_id: str,
+        *,
+        as_of: date,
+        document_scope: str | None = None,
+    ) -> GraphSearchResult: ...
+
+    def cargo_evidence(
+        self,
+        person_id: str,
+        cargo_titles: tuple[str, ...],
+        *,
+        as_of: date,
+        document_scope: str | None = None,
+    ) -> tuple[GraphEvidence, ...]: ...
 
 
 class ChatModel(Protocol):
@@ -178,6 +224,14 @@ class GraphRAGPipeline:
             raise ValueError("document_scope deve ser ORGANIZACAO, PESSOA ou None.")
 
         normalized_question = question.strip()
+        structured = self._answer_structured(
+            normalized_question,
+            as_of=as_of,
+            top_k=top_k,
+            document_scope=document_scope,
+        )
+        if structured is not None:
+            return structured
         if not any(
             term in normalized_question.casefold()
             for term in _REPORTING_INTENT_TERMS
@@ -218,6 +272,12 @@ class GraphRAGPipeline:
         if role_occupant is not None:
             graph_result = replace(
                 graph_result,
+                evidence=graph_result.evidence
+                + self._role_evidence(
+                    role_occupant,
+                    as_of,
+                    document_scope,
+                ),
                 cypher=(
                     CARGO_OCCUPANTS_QUERY.strip()
                     + "\n\n"
@@ -298,6 +358,25 @@ class GraphRAGPipeline:
                     + ", ".join(subordinates)
                     + "."
                 )
+                if role_occupant is not None:
+                    answer = (
+                        f"{manager_name} ocupa o cargo de "
+                        f"{', '.join(role_occupant.cargo_canonico)} em "
+                        f"{as_of.isoformat()}. "
+                        + answer
+                    )
+                relevant_ids = {
+                    relationship.source_id
+                    for path in relevant_paths
+                    for relationship in path.relationships
+                }
+                if role_occupant is not None:
+                    relevant_ids.add(role_occupant.person.funcionario_id)
+                cited = self._graph_sources(
+                    sources,
+                    graph_result,
+                    relevant_ids,
+                )
                 deterministic_payload = {
                     "status": "answered",
                     "answer": answer,
@@ -306,7 +385,7 @@ class GraphRAGPipeline:
                             "doc_id": source.doc_id,
                             "chunk_id": source.chunk_id,
                         }
-                        for source in sources
+                        for source in cited
                     ],
                 }
                 return self._build_response(
@@ -314,6 +393,7 @@ class GraphRAGPipeline:
                     sources,
                     replace(graph_result, paths=relevant_paths),
                     as_of,
+                    graph_grounded=True,
                     knowledge_package={
                         "as_of": as_of.isoformat(),
                         "facts": [
@@ -348,7 +428,7 @@ class GraphRAGPipeline:
                                 "text": source.text,
                                 "origins": list(source.origins),
                             }
-                            for source in sources
+                            for source in cited
                         ],
                     },
                 )
@@ -452,6 +532,262 @@ class GraphRAGPipeline:
             knowledge_package=evidence,
         )
 
+    def _role_evidence(
+        self,
+        occupant: GraphCargoOccupant,
+        as_of: date,
+        document_scope: str | None,
+    ) -> tuple[GraphEvidence, ...]:
+        if not hasattr(self._graph_search, "cargo_evidence"):
+            return ()
+        return self._graph_search.cargo_evidence(
+            occupant.person.funcionario_id,
+            occupant.cargo_canonico,
+            as_of=as_of,
+            document_scope=document_scope,
+        )
+
+    @staticmethod
+    def _graph_sources(
+        sources: list[GraphRAGSource],
+        graph_result: GraphSearchResult,
+        relevant_ids: set[str],
+    ) -> list[GraphRAGSource]:
+        """Fontes originadas no grafo para as pessoas relevantes à resposta."""
+        keys = {
+            (item.doc_id, item.chunk_id)
+            for item in graph_result.evidence
+            if item.funcionario_id in relevant_ids
+        }
+        return [
+            source
+            for source in sources
+            if "graph" in source.origins
+            and (source.doc_id, source.chunk_id) in keys
+        ]
+
+    def _answer_structured(
+        self,
+        question: str,
+        *,
+        as_of: date,
+        top_k: int,
+        document_scope: str | None,
+    ) -> GraphRAGResponse | None:
+        """Responde de forma determinística a gestor, cadeia, caminho e cargo.
+
+        Retorna None quando a pergunta não é desses tipos, deixando o fluxo
+        de subordinados seguir.
+        """
+        folded = _fold(question)
+        if not (
+            _role_titles_in_question(question)
+            or any(
+                term in folded
+                for term in _UPWARD_INTENT_TERMS + _CONNECTION_INTENT_TERMS
+            )
+        ):
+            return None
+        people = list(self._graph_search.people_mentioned_in(question))
+        # Nomes próprios não podem acionar intenções (ex.: sobrenome "Equipe").
+        intent_text = question
+        for person in people:
+            intent_text = re.sub(
+                re.escape(person.nome), " ", intent_text, flags=re.IGNORECASE
+            )
+        normalized = _fold(intent_text)
+        has_subordinate_intent = any(
+            term in intent_text.casefold() for term in _REPORTING_INTENT_TERMS
+        )
+        upward = not has_subordinate_intent and any(
+            term in normalized for term in _UPWARD_INTENT_TERMS
+        )
+        connection = any(term in normalized for term in _CONNECTION_INTENT_TERMS)
+        role_titles = _role_titles_in_question(question)
+        if not (upward or connection or (role_titles and not has_subordinate_intent)):
+            return None
+        if has_subordinate_intent and not connection:
+            return None
+
+        role_occupant: GraphCargoOccupant | None = None
+        if role_titles:
+            occupants = self._graph_search.people_occupying_cargo(
+                role_titles,
+                organization_id=_CEO_ORGANIZATION_ID,
+                as_of=as_of,
+            )
+            if len(occupants) != 1:
+                return self._insufficient(as_of)
+            role_occupant = occupants[0]
+            if role_occupant.person.funcionario_id not in {
+                person.funcionario_id for person in people
+            }:
+                people.append(role_occupant.person)
+
+        cypher = ""
+        paths: tuple[GraphPath, ...] = ()
+        evidence: tuple[GraphEvidence, ...] = ()
+        if len(people) == 2 and people[0].funcionario_id == people[1].funcionario_id:
+            return None
+        if len(people) == 2 and connection:
+            result = self._graph_search.shortest_path(
+                people[0].funcionario_id,
+                people[1].funcionario_id,
+                as_of=as_of,
+                document_scope=document_scope,
+            )
+            if not result.paths:
+                return self._insufficient(as_of, cypher=result.cypher)
+            path = result.paths[0]
+            names_by_id = {
+                person.funcionario_id: person.nome for person in path.people
+            }
+            hops = "; ".join(
+                f"{names_by_id[hop.source_id]} reporta a "
+                f"{names_by_id[hop.target_id]}"
+                for hop in path.relationships
+            )
+            answer = (
+                f"O menor caminho (REPORTS_TO, vigente em {as_of.isoformat()}) "
+                f"entre {people[0].nome} e {people[1].nome} tem "
+                f"{len(path.relationships)} salto(s): {hops}."
+            )
+        elif len(people) == 1 and upward:
+            result = self._graph_search.management_chain(
+                people[0].funcionario_id,
+                as_of=as_of,
+                document_scope=document_scope,
+            )
+            if not result.paths:
+                return self._insufficient(as_of, cypher=result.cypher)
+            path = result.paths[0]
+            chain = " → ".join(person.nome for person in path.people)
+            answer = (
+                f"O gestor direto de {people[0].nome} é {path.people[1].nome}. "
+                f"Cadeia hierárquica vigente em {as_of.isoformat()}: {chain}."
+            )
+        elif len(people) == 1 and role_occupant is not None:
+            titles = ", ".join(role_occupant.cargo_canonico)
+            answer = (
+                f"{role_occupant.person.nome} ocupa o cargo de {titles} "
+                f"em {as_of.isoformat()}."
+            )
+            result = GraphSearchResult(
+                paths=(),
+                evidence=(),
+                cypher=CARGO_OCCUPANTS_QUERY,
+                as_of=as_of,
+            )
+            path = None
+        else:
+            return None
+
+        cypher = result.cypher
+        evidence = result.evidence
+        paths = result.paths
+        if role_occupant is not None:
+            evidence = evidence + self._role_evidence(
+                role_occupant, as_of, document_scope
+            )
+            role_queries = [
+                CARGO_OCCUPANTS_QUERY.strip(),
+                CARGO_EVIDENCE_QUERY.strip(),
+            ]
+            if path is not None:
+                role_queries.append(cypher.strip())
+            cypher = "\n\n".join(role_queries)
+        graph_result = GraphSearchResult(
+            paths=paths,
+            evidence=evidence,
+            cypher=cypher,
+            as_of=as_of,
+        )
+        if role_occupant is not None and path is not None:
+            answer = (
+                f"{role_occupant.person.nome} ocupa o cargo de "
+                f"{', '.join(role_occupant.cargo_canonico)} em "
+                f"{as_of.isoformat()}. "
+                + answer
+            )
+
+        vector_chunks = self._search.search(
+            question,
+            top_k=top_k,
+            document_scope=document_scope,
+            min_vector_score=self._min_vector_score,
+        )
+        if self._min_vector_score is not None:
+            vector_chunks = [
+                chunk
+                for chunk in vector_chunks
+                if chunk.score is None or chunk.score >= self._min_vector_score
+            ]
+        sources = self._merge_sources(graph_result, vector_chunks)
+        relevant_ids = {item.funcionario_id for item in graph_result.evidence}
+        cited = self._graph_sources(sources, graph_result, relevant_ids)
+        return self._build_response(
+            {
+                "status": "answered",
+                "answer": answer,
+                "citations": [
+                    {"doc_id": item.doc_id, "chunk_id": item.chunk_id}
+                    for item in cited
+                ],
+            },
+            sources,
+            graph_result,
+            as_of,
+            graph_grounded=True,
+            knowledge_package={
+                "as_of": as_of.isoformat(),
+                "facts": [
+                    {
+                        "funcionario_id": person.funcionario_id,
+                        "nome": person.nome,
+                        "relationship_type": "REPORTS_TO",
+                    }
+                    for graph_path in paths
+                    for person in graph_path.people
+                ]
+                + (
+                    [
+                        {
+                            "funcionario_id": role_occupant.person.funcionario_id,
+                            "nome": role_occupant.person.nome,
+                            "cargo_canonico": list(role_occupant.cargo_canonico),
+                        }
+                    ]
+                    if role_occupant is not None
+                    else []
+                ),
+                "relationships": [
+                    {
+                        "type": "REPORTS_TO",
+                        "relacao_id": relationship.relacao_id,
+                        "source_id": relationship.source_id,
+                        "target_id": relationship.target_id,
+                        "valid_from": relationship.valid_from.isoformat(),
+                        "valid_to": (
+                            relationship.valid_to.isoformat()
+                            if relationship.valid_to is not None
+                            else None
+                        ),
+                    }
+                    for graph_path in paths
+                    for relationship in graph_path.relationships
+                ],
+                "document_chunks": [
+                    {
+                        "doc_id": item.doc_id,
+                        "chunk_id": item.chunk_id,
+                        "text": item.text,
+                        "origins": list(item.origins),
+                    }
+                    for item in cited
+                ],
+            },
+        )
+
     @staticmethod
     def _merge_sources(
         graph_result: GraphSearchResult,
@@ -541,6 +877,8 @@ class GraphRAGPipeline:
         graph_result: GraphSearchResult,
         as_of: date,
         knowledge_package: dict[str, Any] | None = None,
+        *,
+        graph_grounded: bool = False,
     ) -> GraphRAGResponse:
         status = payload.get("status")
         citations = payload.get("citations")
@@ -566,6 +904,18 @@ class GraphRAGPipeline:
         answer = payload.get("answer")
         if not isinstance(answer, str) or not answer.strip():
             raise GraphRAGResponseError("Resposta fundamentada sem texto.")
+        if graph_grounded and citations == []:
+            # O escopo documental pode ocultar os chunks; o caminho do grafo
+            # (relações, datas e Cypher) continua sendo a evidência.
+            return GraphRAGResponse(
+                answer=answer.strip(),
+                sources=[],
+                paths=graph_result.paths,
+                status="answered",
+                cypher=graph_result.cypher,
+                as_of=as_of,
+                knowledge_package=knowledge_package,
+            )
         if not isinstance(citations, list) or not citations:
             raise GraphRAGResponseError(
                 "Resposta fundamentada deve citar ao menos um chunk."
@@ -623,6 +973,11 @@ class GraphRAGPipeline:
                 "document_chunks": [],
             },
         )
+
+def _fold(text: str) -> str:
+    decomposed = unicodedata.normalize("NFKD", text.casefold())
+    return "".join(c for c in decomposed if not unicodedata.combining(c))
+
 
 def _role_titles_in_question(question: str) -> tuple[str, ...]:
     if re.search(

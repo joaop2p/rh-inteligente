@@ -279,3 +279,37 @@ def test_pipeline_rejects_empty_question_before_search() -> None:
 
     assert search.arguments is None
     assert llm.messages is None
+
+
+class SequenceLLM:
+    def __init__(self, responses: list[str]) -> None:
+        self.responses = responses
+        self.calls = 0
+
+    def chat(
+        self,
+        messages: Sequence[ChatMessage],
+        *,
+        temperature: float = 0.0,
+        format: str | None = None,
+    ) -> str:
+        self.calls += 1
+        return self.responses.pop(0)
+
+
+def test_pipeline_retries_once_when_model_ignores_json_contract() -> None:
+    valid = json.dumps(
+        {
+            "status": "answered",
+            "answer": "Promoções são anuais.",
+            "citations": [{"doc_id": "DOC-058", "chunk_id": "DOC-058_chunk_002"}],
+        }
+    )
+    llm = SequenceLLM([json.dumps({"organograma": {"ceo": "x"}}), valid])
+
+    response = RAGPipeline(FakeSearch([retrieved_chunk()]), llm).answer(
+        "Como ocorrem as promoções?"
+    )
+
+    assert response.status == "answered"
+    assert llm.calls == 2

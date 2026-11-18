@@ -47,15 +47,23 @@ class _EvidenceSearch:
         return self._chunks[:top_k]
 
 
+_DISMISSAL_TERMS = (
+    "desligamento",
+    "desligad",
+    "demissao",
+    "demissão",
+    "demitid",
+    "rescisao",
+    "rescisão",
+)
+
+
 def _topic_filtered_metadata(
     question: str,
     evidence: tuple[DocumentEvidence, ...],
 ) -> tuple[DocumentEvidence, ...]:
     normalized = question.casefold()
-    if any(
-        term in normalized
-        for term in ("desligamento", "desligamentos", "demissao", "rescisao")
-    ):
+    if any(term in normalized for term in _DISMISSAL_TERMS):
         return tuple(
             item
             for item in evidence
@@ -110,10 +118,7 @@ def _deterministic_desligamentos(
     evidence: tuple[DocumentEvidence, ...],
 ) -> tuple[str, list[GraphRAGSource]] | None:
     normalized = question.casefold()
-    if not any(
-        term in normalized
-        for term in ("desligamento", "desligamentos", "demissao", "rescisao")
-    ):
+    if not any(term in normalized for term in _DISMISSAL_TERMS):
         return None
     records: list[tuple[str, str, str]] = []
     seen_docs: set[str] = set()
@@ -242,7 +247,7 @@ class KAGPipeline:
             metadata_evidence = (
                 self._graph_search.search_documents(
                     question,
-                    document_scope=None,
+                    document_scope=document_scope,
                 )
                 if hasattr(self._graph_search, "search_documents")
                 else ()
@@ -251,7 +256,7 @@ class KAGPipeline:
                 rag_response = self._rag_pipeline.answer(
                     question,
                     top_k=max(top_k, 12),
-                    document_scope=None,
+                    document_scope=document_scope,
                 )
             except RAGResponseError:
                 rag_response = RAGResponse(
@@ -270,7 +275,7 @@ class KAGPipeline:
                             mentioned[0].funcionario_id,
                             as_of=as_of,
                             max_paths=100,
-                            document_scope=None,
+                            document_scope=document_scope,
                         )
                         direct_names = [
                             path.people[0].nome
@@ -501,14 +506,24 @@ class KAGPipeline:
                     rag_response = evidence_pipeline.answer(
                         question,
                         top_k=max(top_k, 12),
-                        document_scope=None,
+                        document_scope=document_scope,
                     )
                 except RAGResponseError:
-                    rag_response = self._rag_pipeline.answer(
-                        question,
-                        top_k=max(top_k, 12),
-                        document_scope=None,
-                    )
+                    try:
+                        rag_response = self._rag_pipeline.answer(
+                            question,
+                            top_k=max(top_k, 12),
+                            document_scope=document_scope,
+                        )
+                    except RAGResponseError:
+                        rag_response = RAGResponse(
+                            answer=(
+                                "Não encontrei evidências documentais suficientes "
+                                "para responder a essa pergunta."
+                            ),
+                            sources=[],
+                            status="insufficient",
+                        )
             if rag_response.status == "answered":
                 cited_keys = {
                     (source.doc_id, source.chunk_id)
@@ -527,10 +542,10 @@ class KAGPipeline:
                     if "graph" not in existing.origins:
                         continue
                     sources_by_key[key] = existing
-            elif metadata_evidence:
+            elif metadata_evidence and filtered_metadata:
                 relevant = [
                     evidence
-                    for evidence in metadata_evidence
+                    for evidence in filtered_metadata
                     if evidence.chunk_id
                 ]
                 if relevant:
