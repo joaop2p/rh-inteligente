@@ -162,13 +162,40 @@ class RAGPipeline:
     @staticmethod
     def _parse_payload(raw_response: str) -> dict[str, Any]:
         try:
-            payload = json.loads(raw_response)
+            cleaned = raw_response.strip()
+            if cleaned.startswith("```"):
+                cleaned = cleaned.split("```", 2)[1]
+                if cleaned.startswith("json"):
+                    cleaned = cleaned[4:]
+            payload = json.loads(cleaned.strip())
         except json.JSONDecodeError as exc:
             raise RAGResponseError(
                 "O modelo retornou uma resposta fora do formato JSON exigido."
             ) from exc
         if not isinstance(payload, dict):
             raise RAGResponseError("A resposta do modelo deve ser um objeto JSON.")
+        if "status" not in payload:
+            if isinstance(payload.get("answer"), str) and isinstance(
+                payload.get("citations"), list
+            ):
+                payload["status"] = (
+                    "answered"
+                    if payload["citations"]
+                    else "insufficient"
+                )
+            elif (
+                isinstance(payload.get("doc_id"), str)
+                and isinstance(payload.get("chunk_id"), str)
+                and isinstance(payload.get("text"), str)
+            ):
+                payload["status"] = "answered"
+                payload["answer"] = payload["text"]
+                payload["citations"] = [
+                    {
+                        "doc_id": payload["doc_id"],
+                        "chunk_id": payload["chunk_id"],
+                    }
+                ]
         return payload
 
     @staticmethod
@@ -189,7 +216,10 @@ class RAGPipeline:
                 status="insufficient",
             )
         if status != "answered":
-            raise RAGResponseError("Status da resposta do modelo é inválido.")
+            raise RAGResponseError(
+                "Status da resposta do modelo é inválido: "
+                + json.dumps(payload, ensure_ascii=False)
+            )
 
         answer = payload.get("answer")
         citations = payload.get("citations")

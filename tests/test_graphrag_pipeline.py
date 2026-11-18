@@ -21,6 +21,7 @@ from src.retrieval.graph_search import (
     GraphSearchResult,
 )
 from src.retrieval.vector_search import RetrievedChunk
+from src.retrieval.graph_search import DocumentEvidence
 
 
 class FakeSearch:
@@ -45,6 +46,7 @@ class FakeGraphSearch:
         people: tuple[GraphPerson, ...],
         result: GraphSearchResult,
         role_people: tuple[GraphCargoOccupant, ...] = (),
+        document_evidence: tuple[DocumentEvidence, ...] = (),
     ) -> None:
         self.people = people
         self.result = result
@@ -52,6 +54,7 @@ class FakeGraphSearch:
         self.people_calls: list[str] = []
         self.role_calls: list[tuple[tuple[str, ...], str, date]] = []
         self.reporting_calls: list[tuple[str, date, str | None, int]] = []
+        self.document_evidence = document_evidence
 
     def people_mentioned_in(self, text: str) -> tuple[GraphPerson, ...]:
         self.people_calls.append(text)
@@ -66,6 +69,14 @@ class FakeGraphSearch:
     ) -> tuple[GraphCargoOccupant, ...]:
         self.role_calls.append((cargo_titles, organization_id, as_of))
         return self.role_people
+
+    def search_documents(
+        self,
+        text: str,
+        *,
+        document_scope: str | None = None,
+    ) -> tuple[DocumentEvidence, ...]:
+        return self.document_evidence
 
     def reporting_chain(
         self,
@@ -208,8 +219,45 @@ def test_kag_answers_basic_document_questions_when_graph_intent_is_absent() -> N
         "CHUNK-FERIAS"
     )
     assert search.calls == [
-        ("Qual é a política de férias?", 5, "ORGANIZACAO", None)
+        ("Qual é a política de férias?", 12, None, None)
     ]
+
+
+def test_kag_uses_document_metadata_when_vector_search_is_empty() -> None:
+    search = FakeSearch([])
+    evidence = (
+        DocumentEvidence(
+            doc_id="DOC-055",
+            chunk_id="DOC-055_chunk_001",
+            text="Aviso de férias de 15 dias.",
+            matched_terms=("ferias", "afastamento"),
+        ),
+    )
+    graph_search = FakeGraphSearch(
+        (),
+        _graph_result(paths=(), evidence=()),
+        document_evidence=evidence,
+    )
+    llm = FakeLLM(
+        {
+            "status": "answered",
+            "answer": "Há um aviso de férias de 15 dias.",
+            "citations": [
+                {"doc_id": "DOC-055", "chunk_id": "DOC-055_chunk_001"}
+            ],
+        }
+    )
+
+    response = KAGPipeline(search, graph_search, llm).answer(
+        "Qual é a política de férias?",
+        as_of=date(2025, 1, 1),
+        document_scope="ORGANIZACAO",
+    )
+
+    assert response.status == "answered"
+    assert response.sources[0].origins == ("graph",)
+    assert response.knowledge_package is not None
+    assert response.knowledge_package["document_chunks"][0]["doc_id"] == "DOC-055"
 
 
 def test_pipeline_fuses_graph_and_vector_chunks_and_validates_citations() -> None:

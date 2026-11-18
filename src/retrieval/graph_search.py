@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -116,6 +117,34 @@ RETURN
 ORDER BY length(path), subordinate.nome, subordinate.funcionario_id
 """.replace("__MAX_HOPS__", str(MAX_HOPS))
 
+DOCUMENT_METADATA_SEARCH_QUERY = """
+MATCH (document:Documento)-[:TEM_TRECHO]->(chunk:Chunk)
+WHERE $document_scope IS NULL OR document.escopo = $document_scope
+WITH document, chunk,
+     toLower(trim(coalesce(document.titulo, '') + ' ' +
+                  coalesce(document.tipo, '') + ' ' +
+                  coalesce(document.categoria, '') + ' ' +
+                  coalesce(document.resumo, '') + ' ' +
+                  coalesce(chunk.texto, ''))) AS raw_searchable
+WITH document, chunk,
+     reduce(
+       normalized = raw_searchable,
+       pair IN [
+         ['á','a'],['à','a'],['ã','a'],['â','a'],
+         ['é','e'],['ê','e'],['í','i'],['ó','o'],
+         ['õ','o'],['ô','o'],['ú','u'],['ç','c']
+       ] |
+       replace(normalized, pair[0], pair[1])
+     ) AS searchable
+WHERE any(term IN $terms WHERE searchable CONTAINS term)
+RETURN
+    document.doc_id AS doc_id,
+    chunk.chunk_id AS chunk_id,
+    chunk.texto AS text,
+    searchable
+LIMIT 30
+"""
+
 
 class GraphDatabase(Protocol):
     def execute_read(
@@ -177,6 +206,14 @@ class GraphEvidence:
     chunk_id: str
     text: str
     funcionario_id: str
+
+
+@dataclass(frozen=True)
+class DocumentEvidence:
+    doc_id: str
+    chunk_id: str
+    text: str
+    matched_terms: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -318,11 +355,106 @@ def _parse_evidence(records: object) -> tuple[GraphEvidence, ...]:
     )
 
 
+def _normalize_search_text(text: str) -> str:
+    normalized = unicodedata.normalize("NFKD", text.casefold())
+    return "".join(
+        character
+        for character in normalized
+        if not unicodedata.combining(character)
+    )
+
+
+_DOCUMENT_TOPIC_ALIASES = {
+    "ferias": ("ferias", "férias", "afastamento"),
+    "ferias vencidas": ("ferias", "vencidas"),
+    "promocao": ("promocao", "promocoes", "promoção", "promoções"),
+    "desligamento": (
+        "desligamento",
+        "rescisao",
+        "demissao",
+        "dispensa",
+        "trct",
+    ),
+    "beneficios": ("beneficios", "benefício", "beneficios", "plano"),
+    "avaliacao": ("avaliacao", "desempenho", "melhoria"),
+}
+
+
+def _document_search_terms(text: str) -> tuple[str, ...]:
+    normalized = _normalize_search_text(text)
+    raw_terms = re.findall(r"[a-z0-9]+", normalized)
+    stopwords = {
+        "a", "as", "o", "os", "da", "das", "de", "do", "dos",
+        "e", "qual", "quais", "como", "sobre", "da", "nova",
+        "novatech", "documento", "documentos", "fala", "falam",
+        "empresa", "politica", "processo",
+    }
+    terms = {
+        term
+        for term in raw_terms
+        if len(term) >= 3 and term not in stopwords
+    }
+    for key, aliases in _DOCUMENT_TOPIC_ALIASES.items():
+        if key in normalized:
+            terms.update(_normalize_search_text(alias) for alias in aliases)
+    for alias_group in _DOCUMENT_TOPIC_ALIASES.values():
+        if any(alias in normalized for alias in alias_group):
+            terms.update(_normalize_search_text(alias) for alias in alias_group)
+    return tuple(sorted(term for term in terms if term))
+
+
 class GraphSearch:
     """Executa travessias permitidas e retorna caminhos com proveniência."""
 
     def __init__(self, database: GraphDatabase) -> None:
         self._database = database
+
+    def search_documents(
+        self,
+        text: str,
+        *,
+        document_scope: str | None = None,
+    ) -> tuple[DocumentEvidence, ...]:
+        terms = _document_search_terms(text)
+        if not terms:
+            return ()
+        records = self._database.execute_read(
+            DOCUMENT_METADATA_SEARCH_QUERY,
+            {
+                "terms": terms,
+                "document_scope": document_scope,
+            },
+        )
+        evidence: dict[tuple[str, str], DocumentEvidence] = {}
+        for record in records:
+            doc_id = record.get("doc_id")
+            chunk_id = record.get("chunk_id")
+            chunk_text = record.get("text")
+            searchable = record.get("searchable")
+            if not isinstance(doc_id, str) or not isinstance(chunk_id, str):
+                continue
+            if not isinstance(chunk_text, str) or not chunk_text.strip():
+                continue
+            searchable_text = searchable if isinstance(searchable, str) else ""
+            matches = tuple(
+                term for term in terms if term in searchable_text
+            )
+            evidence[(doc_id, chunk_id)] = DocumentEvidence(
+                doc_id=doc_id,
+                chunk_id=chunk_id,
+                text=chunk_text,
+                matched_terms=matches,
+            )
+        return tuple(
+            sorted(
+                evidence.values(),
+                key=lambda item: (
+                    -len(item.matched_terms),
+                    item.doc_id,
+                    item.chunk_id,
+                ),
+            )
+        )
 
     def resolve_person_name(self, name: str) -> GraphPerson | None:
         if not isinstance(name, str) or not name.strip():
@@ -479,6 +611,8 @@ class GraphSearch:
 
 __all__ = [
     "CARGO_OCCUPANTS_QUERY",
+    "DocumentEvidence",
+    "DOCUMENT_METADATA_SEARCH_QUERY",
     "GraphCargoOccupant",
     "GraphEntityAmbiguousError",
     "GraphEntityNotFoundError",
