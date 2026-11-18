@@ -149,6 +149,7 @@ class OllamaClient:
         *,
         temperature: float = 0.0,
         max_tokens: int | None = None,
+        format: Literal["json"] | None = None,
     ) -> str:
         """Gera texto a partir de mensagens; não envia dados ao Ollama além delas."""
         if not messages:
@@ -157,6 +158,8 @@ class OllamaClient:
             raise ValueError("temperature deve estar entre 0 e 2.")
         if max_tokens is not None and max_tokens <= 0:
             raise ValueError("max_tokens deve ser maior que zero.")
+        if format not in {None, "json"}:
+            raise ValueError("format deve ser 'json' ou None.")
         for message in messages:
             if message.get("role") not in {"system", "user", "assistant"}:
                 raise ValueError("Cada mensagem deve ter role system, user ou assistant.")
@@ -166,16 +169,16 @@ class OllamaClient:
         options: dict[str, int | float] = {"temperature": temperature}
         if max_tokens is not None:
             options["num_predict"] = max_tokens
-        payload = self._request(
-            "/api/chat",
-            {
-                "model": self._resolve_model(),
-                "messages": list(messages),
-                "stream": False,
-                "think": False,
-                "options": options,
-            },
-        )
+        body: dict[str, Any] = {
+            "model": self._resolve_model(),
+            "messages": list(messages),
+            "stream": False,
+            "think": False,
+            "options": options,
+        }
+        if format is not None:
+            body["format"] = format
+        payload = self._request("/api/chat", body)
         response_message = payload.get("message")
         if not isinstance(response_message, dict):
             raise LLMRequestError("Resposta do Ollama sem objeto 'message'.")

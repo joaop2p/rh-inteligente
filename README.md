@@ -2,7 +2,7 @@
 
 Aplicação monolítica em Python e Streamlit para consultas de Recursos Humanos, com Neo4j como base de conhecimento em modelo LPG (*Labeled Property Graph*) e previsão de fluxos **RAG, GraphRAG e KAG**.
 
-> **Estado do projeto:** os scripts de ingestão do cadastro mestre, relações, metadados documentais, chunks e embeddings foram executados no Neo4j. A busca vetorial inicial de chunks está implementada em `src/retrieval/vector_search.py`, mas ainda não está integrada ao fluxo RAG de ponta a ponta nem ao Streamlit. GraphRAG e KAG ainda não estão implementados.
+> **Estado do projeto:** os scripts de ingestão do cadastro mestre, relações, metadados documentais, chunks e embeddings foram executados no Neo4j. A recuperação híbrida e o pipeline RAG com proveniência estão conectados ao modo RAG do Streamlit, com exibição das fontes. GraphRAG, KAG, visualização de caminhos e persistência de conversas ainda não estão implementados.
 
 ## 1. Objetivo
 
@@ -203,7 +203,7 @@ Para preparar uma instalação nova:
 6. Executar `neo4j/00_schema.cypher` no Neo4j Browser.
 7. Validar constraints e índices com `SHOW CONSTRAINTS;` e `SHOW INDEXES;`.
 
-No banco usado na ingestão descrita neste README, os dados mestres, relações, metadados documentais, chunks e embeddings já foram carregados. O índice vetorial `chunk_embedding` foi verificado como `ONLINE`; o script completo de schema ainda não foi executado/verificado nesse banco. A busca vetorial inicial está implementada, mas a integração de ponta a ponta com RAG/Ollama/Streamlit, GraphRAG e KAG ainda precisa ser feita.
+No banco usado na ingestão descrita neste README, os dados mestres, relações, metadados documentais, chunks e embeddings já foram carregados. Os índices `chunk_embedding` e `chunk_fulltext` foram verificados como `ONLINE`; o script completo de schema ainda não foi executado/verificado nesse banco. O modo RAG está conectado ao backend e à interface; uma validação manual do fluxo real no navegador ainda é recomendada.
 
 ### Executar a interface
 
@@ -213,30 +213,56 @@ Com o Ollama acessível via Tailscale e `TAILSCALE_MODEL_HOST` configurado no `.
 .venv/bin/streamlit run app.py
 ```
 
-O chat mantém a conversa na sessão do navegador e oferece temas claro/escuro. Em **Conversa direta**, as mensagens são enviadas ao Ollama, sem consultar documentos ou Neo4j; respostas sobre o dataset não são fundamentadas. Os modos **RAG**, **GraphRAG** e **KAG**, as referências e a visualização de caminho são espaços reservados e não executam buscas. Não envie dados pessoais ou sensíveis durante este teste.
+O chat mantém conversas separadas por modo somente na sessão do navegador e oferece temas claro/escuro. Em **Conversa direta**, as mensagens são enviadas ao Ollama, sem consultar documentos ou Neo4j; respostas sobre o dataset não são fundamentadas. **RAG** consulta os índices Neo4j, envia a pergunta, `doc_id`/`chunk_id` e trechos recuperados ao Ollama configurado via Tailscale e mostra as citações documentais. É necessário marcar a autorização explícita no painel; escolha o escopo documental, use apenas dados saneados e confirme a autorização para o escopo `PESSOA`. O histórico RAG é exibido, mas não é enviado como evidência ao modelo. **GraphRAG** e **KAG** continuam indisponíveis, assim como a visualização de caminhos e a persistência de conversas.
 
 O acesso ao Neo4j está encapsulado em `src/database/neo4j.py`, com transações de leitura/escrita e parâmetros Cypher separados da consulta. A geração em `src/generation/llm.py` usa a API nativa de chat do Ollama no host indicado por `TAILSCALE_MODEL_HOST` (URL ou host/porta, normalmente com a porta padrão do Ollama). Se houver exatamente um modelo instalado, ele é selecionado automaticamente. Com mais de um modelo, informe `model_name` ao criar `OllamaClient`.
 
-### Recuperação vetorial inicial
+### Recuperação híbrida inicial e pipeline RAG
 
-`src/retrieval/vector_search.py` implementa uma busca inicial de chunks pelo índice Neo4j `chunk_embedding`. `VectorSearch` recebe uma conexão `Neo4jDatabase` e um modelo de embeddings, gera o vetor da pergunta com `BAAI/bge-m3` (1024 dimensões, normalizado) e retorna até cinco resultados tipados com `doc_id`, `chunk_id`, texto e score. O valor de `top_k` pode ser ajustado por chamada; embeddings com dimensão ou valores inválidos e resultados sem proveniência são rejeitados.
+`src/retrieval/vector_search.py` consulta os índices Neo4j `chunk_embedding` e `chunk_fulltext` e combina as listas por Reciprocal Rank Fusion (RRF). Não compara diretamente score vetorial e score lexical. `RetrievedChunk.score` é a similaridade vetorial (ou `None` se o resultado veio somente da busca lexical); `fulltext_score` é o score lexical bruto; `rank_score` é o sinal usado para ordenar a fusão. Nenhum desses valores representa confiança.
+
+`VectorSearch.search` aceita `document_scope="ORGANIZACAO"` ou `"PESSOA"` para restringir explicitamente a busca ao escopo dos metadados documentais. O escopo não é inferido da pergunta. A busca consulta até 250 candidatos por índice antes de filtrar/fundir, conforme o limite do protótipo. Uma recuperação com candidatos não prova que exista evidência suficiente: não há limiar validado nem detecção semântica determinística de suporte.
+
+`VectorSearch` mantém as procedures `db.index.vector.queryNodes` e `db.index.fulltext.queryNodes` para compatibilidade com instalações anteriores. `SearchClauseVectorSearch` oferece o caminho paralelo com a cláusula Cypher 25 `SEARCH`, sem esses avisos de depreciação. A documentação oficial declara suporte a busca vetorial por `SEARCH` desde Neo4j 2026.01 e full-text desde 2026.09; teste a disponibilidade na sua instância antes de selecionar essa classe.
 
 Exemplo de uso:
 
 ```python
 from src.database.neo4j import Neo4jDatabase
-from src.retrieval.vector_search import VectorSearch, load_embedding_model
+from src.retrieval.vector_search import SearchClauseVectorSearch, load_embedding_model
 
 with Neo4jDatabase.from_env() as graph:
-    chunks = VectorSearch(graph, load_embedding_model()).search(
-        "Quais são as condições de férias?",
+    chunks = SearchClauseVectorSearch(graph, load_embedding_model()).search(
+        "Quais são os critérios de promoção?",
         top_k=5,
+        document_scope="ORGANIZACAO",
     )
     for chunk in chunks:
-        print(chunk.doc_id, chunk.chunk_id, chunk.score, chunk.texto)
+        print(
+            chunk.doc_id,
+            chunk.chunk_id,
+            chunk.score,
+            chunk.fulltext_score,
+            chunk.rank_score,
+            chunk.texto,
+        )
 ```
 
-Esse componente recupera evidências, mas ainda não chama o Ollama, não aplica limiar de relevância e não está conectado ao Streamlit. Uma busca vetorial sozinha não é GraphRAG; o fluxo híbrido, a construção KAG e respostas com declaração de insuficiência ainda estão pendentes.
+`src/rag/pipeline.py` usa os resultados como candidatos documentais e solicita ao Ollama JSON com status, resposta e citações. A instrução restringe o modelo a RH da NovaTech e às evidências daquela pergunta; o histórico de conversa não é enviado como prova. Respostas citadas são aceitas somente se os pares `doc_id`/`chunk_id` existirem entre os trechos recuperados. Sem resultados, o LLM não é chamado; se o modelo marcar insuficiência, o pipeline retorna a mensagem fixa sem fontes.
+
+Isso não garante, por si só, a validade semântica da resposta: o modelo ainda pode classificar incorretamente um trecho como suficiente. A interface RAG já está conectada, mas a qualidade da relevância e a insuficiência semântica ainda precisam de avaliação mais abrangente. A busca híbrida documental não substitui o GraphRAG: consultas Cypher estruturadas, multi-hop e KAG continuam pendentes.
+
+Para testar a busca contra o Neo4j configurado e o modelo BGE-M3 real, com os dados saneados já carregados:
+
+```bash
+RH_RUN_NEO4J_INTEGRATION=1 .venv/bin/python -m pytest -q \
+  tests/test_vector_search_integration.py \
+  tests/test_rag_pipeline_integration.py
+```
+
+Os testes incluem dez perguntas com trechos-alvo revisados e um fluxo do pipeline com recuperação real e LLM simulado. Os testes automatizados não chamam o Ollama e não substituem uma avaliação abrangente. Em uma verificação manual no terminal com `qwen3.5:9b`, a pergunta sobre critérios de promoção recebeu resposta com citação válida usando somente a frase relevante da política. Em uma pergunta sobre quem foi promovido nos últimos 12 meses, o modelo retornou `insufficient` quando recebeu somente a evidência que indicava uma possível promoção, sem confirmação. A busca pode retornar candidatos para perguntas fora do domínio ou sem suporte; scores não são evidência suficiente por si sós.
+
+Na instância verificada, `dbms.components()` informou Neo4j `5.27-aura` e Cypher 5/25; as consultas vetorial e full-text com `SEARCH` foram executadas sem os avisos de depreciação. Essa disponibilidade observada é específica à instância: a documentação oficial indica suporte geral a vetores por `SEARCH` a partir do Neo4j 2026.01 e full-text a partir do 2026.09. A rota de compatibilidade continua disponível em `VectorSearch`; valide suporte na sua própria instância antes de selecionar `SearchClauseVectorSearch`. Consulte a [documentação oficial da cláusula SEARCH](https://neo4j.com/docs/cypher-manual/current/clauses/search/) e a [visão geral dos índices](https://neo4j.com/docs/cypher-manual/current/indexes/search-indexes/).
 
 Exemplo de uso:
 

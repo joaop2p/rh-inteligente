@@ -1,16 +1,60 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
-from typing import Sequence
+from typing import Literal, Sequence
 
 import pytest
 from streamlit.proto.SelectWidgetFilterMode_pb2 import FILTER_MODE_NONE
 from streamlit.testing.v1 import AppTest
 
+from src.database.neo4j import Neo4jDatabase
 from src.generation.llm import ChatMessage, LLMRequestError, OllamaClient
+from src.retrieval.vector_search import RetrievedChunk, SearchClauseVectorSearch
+import src.retrieval.vector_search as vector_search
 
 
 APP_PATH = Path(__file__).resolve().parents[1] / "app.py"
+
+
+class FakeDatabase:
+    def __init__(self) -> None:
+        self.verified = False
+        self.closed = False
+
+    def verify_connectivity(self) -> None:
+        self.verified = True
+
+    def __enter__(self) -> FakeDatabase:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.closed = True
+
+
+class FakeRAGLLM:
+    def __init__(self) -> None:
+        self.messages: Sequence[ChatMessage] | None = None
+
+    def chat(
+        self,
+        messages: Sequence[ChatMessage],
+        *,
+        temperature: float = 0.0,
+        format: Literal["json"] | None = None,
+    ) -> str:
+        self.messages = messages
+        assert temperature == 0.0
+        assert format == "json"
+        return json.dumps(
+            {
+                "status": "answered",
+                "answer": "Promoções seguem o ciclo anual.",
+                "citations": [
+                    {"doc_id": "DOC-058", "chunk_id": "DOC-058_chunk_002"}
+                ],
+            }
+        )
 
 
 def test_direct_chat_preserves_history_and_can_be_cleared(
@@ -51,7 +95,7 @@ def test_search_selector_is_not_editable_and_model_selector_is_absent() -> None:
     assert not app.text_input
 
 
-@pytest.mark.parametrize("mode", ["RAG", "GraphRAG", "KAG"])
+@pytest.mark.parametrize("mode", ["GraphRAG", "KAG"])
 def test_unimplemented_search_modes_do_not_enable_chat(mode: str) -> None:
     app = AppTest.from_file(APP_PATH).run()
     app.selectbox[0].set_value(mode).run()
@@ -59,6 +103,80 @@ def test_unimplemented_search_modes_do_not_enable_chat(mode: str) -> None:
     assert not app.exception
     assert app.chat_input[0].disabled
     assert any("ainda não está disponível" in warning.value for warning in app.warning)
+
+
+def test_rag_mode_requires_remote_consent() -> None:
+    app = AppTest.from_file(APP_PATH).run()
+    app.selectbox[0].set_value("RAG").run()
+
+    assert not app.exception
+    assert app.chat_input[0].disabled
+    assert app.checkbox[0].value is False
+    assert len(app.selectbox) == 2
+
+
+def test_rag_mode_queries_pipeline_and_displays_sources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = FakeDatabase()
+    llm = FakeRAGLLM()
+    search_calls: list[tuple[str, int, str | None]] = []
+    retrieved = RetrievedChunk(
+        chunk_id="DOC-058_chunk_002",
+        doc_id="DOC-058",
+        texto="Promoções ocorrem no ciclo anual, com aprovação do gestor e do RH.",
+        score=0.82,
+        rank_score=0.03,
+        fulltext_score=1.5,
+    )
+
+    def fake_search(
+        self: SearchClauseVectorSearch,
+        question: str,
+        top_k: int = 5,
+        document_scope: str | None = None,
+    ) -> list[RetrievedChunk]:
+        search_calls.append((question, top_k, document_scope))
+        return [retrieved]
+
+    monkeypatch.setattr(
+        Neo4jDatabase,
+        "from_env",
+        classmethod(lambda cls: database),
+    )
+    monkeypatch.setattr(vector_search, "load_embedding_model", lambda: object())
+    monkeypatch.setattr(SearchClauseVectorSearch, "search", fake_search)
+    monkeypatch.setattr(
+        OllamaClient,
+        "from_env",
+        classmethod(lambda cls: llm),
+    )
+    app = AppTest.from_file(APP_PATH).run()
+    app.session_state.messages = [
+        {"role": "user", "content": "pergunta direta antiga"},
+        {"role": "assistant", "content": "resposta direta antiga"},
+    ]
+    app.selectbox[0].set_value("RAG").run()
+    app.selectbox[1].set_value("Somente pessoas").run()
+    app.checkbox[0].check().run()
+    app.chat_input[0].set_value("Quais são os critérios de promoção?").run()
+
+    assert not app.exception
+    assert database.verified
+    assert database.closed
+    assert search_calls == [
+        ("Quais são os critérios de promoção?", 5, "PESSOA")
+    ]
+    assert llm.messages is not None
+    assert len(llm.messages) == 2
+    assert "pergunta direta antiga" not in llm.messages[1]["content"]
+    assert app.session_state.messages[0]["content"] == "pergunta direta antiga"
+    assert len(app.session_state.rag_messages) == 2
+    assert app.session_state.rag_status == "answered"
+    assert [source.chunk_id for source in app.session_state.rag_sources] == [
+        "DOC-058_chunk_002"
+    ]
+    assert any("DOC-058" in item.value for item in app.markdown)
 
 
 def test_theme_selection_and_llm_error_are_visible(

@@ -3,12 +3,20 @@
 from __future__ import annotations
 
 import streamlit as st
+from neo4j.exceptions import Neo4jError
 
+from src.database.neo4j import Neo4jConfigurationError, Neo4jDatabase
 from src.generation.llm import (
     ChatMessage,
     LLMConfigurationError,
     LLMRequestError,
     OllamaClient,
+)
+from src.rag.pipeline import RAGPipeline, RAGResponse, RAGResponseError
+from src.retrieval.vector_search import (
+    EmbeddingModel,
+    SearchClauseVectorSearch,
+    load_embedding_model,
 )
 
 
@@ -41,6 +49,21 @@ THEMES = {
         "accent": "#91acff",
     },
 }
+
+
+@st.cache_resource
+def _cached_embedding_model() -> EmbeddingModel:
+    return load_embedding_model()
+
+
+def answer_with_rag(question: str, document_scope: str | None) -> RAGResponse:
+    with Neo4jDatabase.from_env() as database:
+        database.verify_connectivity()
+        search = SearchClauseVectorSearch(database, _cached_embedding_model())
+        return RAGPipeline(search, OllamaClient.from_env()).answer(
+            question,
+            document_scope=document_scope,
+        )
 
 
 def apply_theme(theme: str) -> None:
@@ -102,6 +125,12 @@ def main() -> None:
     st.set_page_config(page_title="RH Inteligente", page_icon="💬", layout="wide")
     if "messages" not in st.session_state:
         st.session_state.messages = []
+    if "rag_messages" not in st.session_state:
+        st.session_state.rag_messages = []
+    if "rag_sources" not in st.session_state:
+        st.session_state.rag_sources = []
+    if "rag_status" not in st.session_state:
+        st.session_state.rag_status = None
 
     with st.sidebar:
         st.markdown("### ◈ RH Inteligente")
@@ -112,13 +141,39 @@ def main() -> None:
         mode = st.selectbox(
             "Modo de busca",
             ("Conversa direta", "RAG", "GraphRAG", "KAG"),
-            help="Os modos de recuperação ainda não estão implementados.",
+            help="RAG está disponível; GraphRAG e KAG ainda estão em desenvolvimento.",
             filter_mode=None,
         )
+        document_scope: str | None = "ORGANIZACAO"
+        rag_authorized = False
+        if mode == "RAG":
+            scope_options = {
+                "Somente organização": "ORGANIZACAO",
+                "Somente pessoas": "PESSOA",
+                "Todos os documentos": None,
+            }
+            scope_label = st.selectbox(
+                "Escopo documental",
+                tuple(scope_options),
+                help="O escopo é escolhido explicitamente e não é inferido da pergunta.",
+            )
+            document_scope = scope_options[scope_label]
+            st.warning(
+                "RAG envia sua pergunta, doc_id/chunk_id e trechos recuperados "
+                "ao Ollama via Tailscale. Use somente dados saneados; no escopo "
+                "PESSOA, confirme que o envio está autorizado."
+            )
+            rag_authorized = st.checkbox(
+                "Entendi e autorizo o envio da pergunta, IDs e trechos recuperados.",
+                key="rag_remote_consent",
+            )
         theme = st.radio("Tema", ("Claro", "Escuro"), horizontal=True)
         st.divider()
         if st.button("Nova conversa", use_container_width=True):
             st.session_state.messages = []
+            st.session_state.rag_messages = []
+            st.session_state.rag_sources = []
+            st.session_state.rag_status = None
             st.rerun()
         st.caption("Não envie dados pessoais ou informações sensíveis.")
 
@@ -127,36 +182,46 @@ def main() -> None:
 
     with conversation:
         st.title("Converse com a IA")
-        st.caption("Um espaço para testar a interação com o modelo local.")
+        st.caption("Assistente de conhecimento de RH da NovaTech.")
         if mode == "Conversa direta":
             st.info(
                 "Conversa de teste: sem consulta ao Neo4j ou aos documentos. "
                 "As respostas não são fundamentadas no dataset."
             )
+            visible_messages = st.session_state.messages
+        elif mode == "RAG":
+            st.info(
+                "RAG responde somente com evidências documentais recuperadas. "
+                "O histórico não é enviado como evidência."
+            )
+            visible_messages = st.session_state.rag_messages
         else:
             st.warning(
-                f"{mode} ainda não está disponível. Selecione Conversa direta "
-                "para falar com o modelo; nenhuma busca será executada."
+                f"{mode} ainda não está disponível; nenhuma busca será executada."
             )
+            visible_messages = []
 
         history = st.container(height=400, border=False)
         with history:
             welcome = st.empty()
-            if not st.session_state.messages:
+            if not visible_messages:
                 with welcome.container(border=True):
                     st.subheader("Como posso ajudar?")
-                    st.write(
-                        "Faça uma pergunta para testar a conversa. Quando a busca "
-                        "estiver integrada, as fontes aparecerão ao lado."
-                    )
+                    if mode == "RAG":
+                        st.write("Faça uma pergunta sobre os documentos de RH da NovaTech.")
+                    else:
+                        st.write("Faça uma pergunta para testar a conversa.")
 
-            for message in st.session_state.messages:
+            for message in visible_messages:
                 with st.chat_message(message["role"]):
                     st.markdown(message["content"])
 
         prompt = st.chat_input(
             "Escreva sua mensagem",
-            disabled=mode != "Conversa direta",
+            disabled=(
+                mode in {"GraphRAG", "KAG"}
+                or (mode == "RAG" and not rag_authorized)
+            ),
         )
         if prompt:
             welcome.empty()
@@ -164,44 +229,106 @@ def main() -> None:
             with history:
                 with st.chat_message("user"):
                     st.markdown(prompt)
-                try:
-                    with st.spinner("Aguardando resposta do modelo..."):
-                        client = OllamaClient.from_env()
-                        answer = client.chat(
-                            [SYSTEM_MESSAGE, *st.session_state.messages, user_message]
+                if mode == "Conversa direta":
+                    try:
+                        with st.spinner("Aguardando resposta do modelo..."):
+                            client = OllamaClient.from_env()
+                            answer = client.chat(
+                                [
+                                    SYSTEM_MESSAGE,
+                                    *st.session_state.messages,
+                                    user_message,
+                                ]
+                            )
+                    except (LLMConfigurationError, LLMRequestError) as exc:
+                        st.error(f"Não foi possível obter uma resposta: {exc}")
+                    else:
+                        assistant_message: ChatMessage = {
+                            "role": "assistant",
+                            "content": answer,
+                        }
+                        st.session_state.messages.extend(
+                            [user_message, assistant_message]
                         )
-                except (LLMConfigurationError, LLMRequestError) as exc:
-                    st.error(f"Não foi possível obter uma resposta: {exc}")
-                else:
-                    assistant_message: ChatMessage = {
-                        "role": "assistant",
-                        "content": answer,
-                    }
-                    st.session_state.messages.extend([user_message, assistant_message])
-                    with st.chat_message("assistant"):
-                        st.markdown(answer)
+                        with st.chat_message("assistant"):
+                            st.markdown(answer)
+                elif mode == "RAG":
+                    st.session_state.rag_sources = []
+                    st.session_state.rag_status = None
+                    try:
+                        with st.spinner("Buscando evidências e consultando o modelo..."):
+                            response = answer_with_rag(prompt, document_scope)
+                    except (LLMConfigurationError, LLMRequestError) as exc:
+                        st.error(f"Não foi possível consultar o Ollama: {exc}")
+                    except Neo4jConfigurationError as exc:
+                        st.error(f"Não foi possível configurar o Neo4j: {exc}")
+                    except Neo4jError as exc:
+                        st.error(f"Falha ao consultar o Neo4j: {exc}")
+                    except RAGResponseError as exc:
+                        st.error(f"A resposta do RAG foi inválida: {exc}")
+                    except RuntimeError as exc:
+                        st.error(f"Não foi possível executar o pipeline RAG: {exc}")
+                    else:
+                        assistant_message = {
+                            "role": "assistant",
+                            "content": response.answer,
+                        }
+                        st.session_state.rag_messages.extend(
+                            [user_message, assistant_message]
+                        )
+                        st.session_state.rag_sources = response.sources
+                        st.session_state.rag_status = response.status
+                        with st.chat_message("assistant"):
+                            st.markdown(response.answer)
 
     with evidence:
         st.subheader("Documentos e referências")
-        st.caption("Evidências da última busca")
-        with st.container(border=True):
-            st.write("Nenhuma busca documental foi realizada.")
-            st.caption(
-                "Quando a recuperação estiver disponível, documentos, "
-                "doc_id e chunk_id aparecerão aqui."
-            )
+        if mode == "RAG":
+            st.caption("Fontes citadas pela resposta RAG mais recente")
+            if st.session_state.rag_sources:
+                for source in st.session_state.rag_sources:
+                    with st.container(border=True):
+                        st.markdown(f"**{source.doc_id} · {source.chunk_id}**")
+                        st.write(source.quote)
+                        with st.expander("Sinais de recuperação"):
+                            st.write(f"Similaridade vetorial: {source.vector_score}")
+                            st.write(f"Score full-text: {source.fulltext_score}")
+                            st.write(f"RRF rank score: {source.rank_score:.6f}")
+            elif st.session_state.rag_status == "insufficient":
+                st.info("A resposta mais recente não citou fontes: evidência insuficiente.")
+            else:
+                st.write("Nenhuma busca RAG foi concluída nesta conversa.")
+        else:
+            with st.container(border=True):
+                st.write("Nenhuma busca documental foi realizada.")
+                st.caption(
+                    "Selecione RAG para consultar documentos e exibir as fontes."
+                )
         st.subheader("Caminho no grafo")
         with st.container(border=True):
             st.write("Visualização do caminho indisponível.")
             st.caption(
-                "Espaço reservado para nós e relações recuperados pelo "
-                "GraphRAG/KAG. Nenhuma consulta ao grafo foi executada."
+                "O RAG recupera trechos documentais, mas não percorre relações. "
+                "GraphRAG/KAG ainda não estão disponíveis."
             )
         with st.expander("Consulta e detalhes da busca"):
-            st.caption(
-                "Espaço reservado para a consulta validada e os detalhes da "
-                "recuperação. Nenhuma consulta está disponível nesta etapa."
-            )
+            if mode == "RAG":
+                scope_label = (
+                    "todos os documentos"
+                    if document_scope is None
+                    else document_scope
+                )
+                st.caption(
+                    "Recuperação híbrida pelos índices vetorial e full-text "
+                    "com Cypher 25 SEARCH. "
+                    f"Escopo explícito: {scope_label}. "
+                    "Scores são sinais de recuperação, não confiança."
+                )
+            else:
+                st.caption(
+                    "GraphRAG/KAG e consultas estruturadas de relações "
+                    "ainda não estão disponíveis."
+                )
 
 
 if __name__ == "__main__":

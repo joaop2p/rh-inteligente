@@ -72,6 +72,27 @@ def test_chat_discovers_single_model_and_sends_non_streaming_request(
     }
 
 
+def test_chat_requests_json_format_when_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[Request] = []
+
+    def fake_urlopen(request: Request, *, timeout: float) -> FakeResponse:
+        requests.append(request)
+        return FakeResponse({"message": {"content": '{"status":"insufficient"}'}})
+
+    monkeypatch.setattr("src.generation.llm.urlopen", fake_urlopen)
+    client = OllamaClient("localhost:11434", model_name="model")
+    client.chat(
+        [{"role": "user", "content": "Responda em JSON."}],
+        format="json",
+    )
+
+    request_data = requests[0].data
+    assert isinstance(request_data, bytes)
+    assert json.loads(request_data)["format"] == "json"
+
+
 def test_model_must_be_explicit_when_server_has_multiple_models(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

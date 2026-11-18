@@ -64,8 +64,8 @@ def test_chunking_preserves_sentence_boundaries_and_canonical_metadata() -> None
         "DOC-001_chunk_002",
     ]
     assert all(chunk["doc_id"] == "DOC-001" for chunk in chunks)
-    assert all(chunk["texto"].endswith(".") for chunk in chunks)
-    assert all(chunk["token_count"] <= 5 for chunk in chunks)
+    assert all(chunk["texto"].endswith(".") for chunk in chunks) # type: ignore
+    assert all(chunk["token_count"] <= 5 for chunk in chunks) # type: ignore
 
 
 def test_chunking_rejects_invalid_limits() -> None:
@@ -92,7 +92,7 @@ def test_chunking_splits_sentence_that_exceeds_limit_without_cutting_words() -> 
         "Uma frase muito",
         "longa sem encerramento.",
     ]
-    assert all(chunk["token_count"] <= 3 for chunk in chunks)
+    assert all(chunk["token_count"] <= 3 for chunk in chunks) # type: ignore
 
 
 def test_chunking_preserves_list_items_and_indentation() -> None:
@@ -184,7 +184,7 @@ def test_generate_embeddings_associates_normalized_vectors_to_chunks() -> None:
     ]
 
     chunks_with_embeddings = generate_embeddings(
-        chunks,
+        chunks, # type: ignore
         model,
         embedding_dimension=2,
         batch_size=8,
