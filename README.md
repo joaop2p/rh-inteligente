@@ -1,8 +1,8 @@
 # Sistema de RH Inteligente — NovaTech
 
-Backend de um sistema de Recursos Humanos que consulta dados organizacionais e documentos internos usando **RAG, GraphRAG e KAG**, com o Neo4j como base de conhecimento em modelo LPG (*Labeled Property Graph*).
+Aplicação monolítica em Python e Streamlit para consultas de Recursos Humanos, com Neo4j como base de conhecimento em modelo LPG (*Labeled Property Graph*) e previsão de fluxos **RAG, GraphRAG e KAG**.
 
-> **Estado do projeto:** os scripts de ingestão do cadastro mestre, relações, metadados documentais, chunks e embeddings foram executados no Neo4j. Isso não significa que os fluxos de recuperação RAG/GraphRAG/KAG ou a API já estejam implementados.
+> **Estado do projeto:** os scripts de ingestão do cadastro mestre, relações, metadados documentais, chunks e embeddings foram executados no Neo4j. A interface Streamlit permite testar conversas diretas com o LLM; os fluxos de recuperação RAG/GraphRAG/KAG ainda não estão implementados.
 
 ## 1. Objetivo
 
@@ -10,22 +10,22 @@ Permitir que usuários façam perguntas sobre a estrutura organizacional e os do
 
 ## 2. Escopo funcional
 
-### Escopo do backend
+### Escopo da aplicação
 - Ingerir documentos TXT (e, futuramente, PDF/DOCX, se necessário).
 - Extrair texto, dividir em chunks e gerar embeddings.
 - Extrair entidades e relações (NER/RE) e resolver nomes para IDs canônicos.
 - Persistir entidades, relacionamentos, documentos e chunks no Neo4j.
 - Executar RAG vetorial, GraphRAG com Cypher e travessias multi-hop.
 - Combinar evidências documentais e estruturais para o fluxo KAG.
-- Retornar resposta, fontes, subgrafo, consulta Cypher e sinais observáveis de recuperação.
+- Exibir resposta, fontes, subgrafo, consulta Cypher e sinais observáveis de recuperação.
 
 ### Fora do primeiro incremento
-- Interface web completa e autenticação/autorização de produção.
+- Autenticação/autorização de produção.
 - Integrações com folha de pagamento, ponto, ERP ou sistemas externos.
 - Decisões automáticas sobre contratação, demissão, promoção ou medidas disciplinares.
 - Uso de dados reais de colaboradores.
 
-A especificação acadêmica exige, na entrega final, interface funcional, visualização interativa do subgrafo e apresentação de rastreabilidade. O desenvolvimento atual pode começar pelo backend, mas a API deve preparar os dados necessários para essa interface.
+A especificação acadêmica exige, na entrega final, interface funcional, visualização interativa do subgrafo e apresentação de rastreabilidade. A aplicação Streamlit é o ponto de interação do sistema monolítico; busca e visualização de evidências ainda serão integradas.
 
 ## 3. Arquitetura conceitual
 
@@ -150,7 +150,7 @@ Fluxo esperado:
 
 A pergunta deve ser ajustada aos dados efetivamente presentes. Se o dataset não sustentar a premissa (por exemplo, não houver gerente de Tecnologia ou contrato temporário correspondente), o sistema deve informar que não encontrou evidência suficiente, em vez de inventar resultados.
 
-## 7. Contrato sugerido da resposta da API
+## 7. Formato sugerido para resposta da aplicação
 
 ```json
 {
@@ -185,7 +185,7 @@ A pergunta deve ser ajustada aos dados efetivamente presentes. Se o dataset não
 | Modelo de dados | LPG |
 | Índices | Unicidade, range, full-text e vector |
 | Embeddings | BAAI/bge-m3, dimensão 1024 (usado e validado na ingestão executada) |
-| Linguagem/API | Python + FastAPI (proposta inicial para o backend; confirmar no repositório) |
+| Aplicação | Python + Streamlit, arquitetura monolítica |
 | LLM | Ollama remoto via Tailscale, configurado por `TAILSCALE_MODEL_HOST` |
 | Orquestração | Implementação direta ou biblioteca; decidir conforme necessidade, sem adicionar dependências sem uso |
 
@@ -203,7 +203,17 @@ Para preparar uma instalação nova:
 6. Executar `neo4j/00_schema.cypher` no Neo4j Browser.
 7. Validar constraints e índices com `SHOW CONSTRAINTS;` e `SHOW INDEXES;`.
 
-No banco usado na ingestão descrita neste README, os dados mestres, relações, metadados documentais, chunks e embeddings já foram carregados. O índice vetorial `chunk_embedding` foi verificado como `ONLINE`; o script completo de schema ainda não foi executado/verificado nesse banco. Os fluxos de recuperação RAG/GraphRAG/KAG e a API também ainda precisam ser implementados. Não há comando de inicialização da API documentado.
+No banco usado na ingestão descrita neste README, os dados mestres, relações, metadados documentais, chunks e embeddings já foram carregados. O índice vetorial `chunk_embedding` foi verificado como `ONLINE`; o script completo de schema ainda não foi executado/verificado nesse banco. Os fluxos de recuperação RAG/GraphRAG/KAG ainda precisam ser implementados.
+
+### Executar a interface
+
+Com o Ollama acessível via Tailscale e `TAILSCALE_MODEL_HOST` configurado no `.env`, execute na raiz do projeto:
+
+```bash
+.venv/bin/streamlit run app.py
+```
+
+O chat mantém a conversa na sessão do navegador e oferece temas claro/escuro. Em **Conversa direta**, as mensagens são enviadas ao Ollama, sem consultar documentos ou Neo4j; respostas sobre o dataset não são fundamentadas. Os modos **RAG**, **GraphRAG** e **KAG**, as referências e a visualização de caminho são espaços reservados e não executam buscas. Não envie dados pessoais ou sensíveis durante este teste.
 
 O acesso ao Neo4j está encapsulado em `src/database/neo4j.py`, com transações de leitura/escrita e parâmetros Cypher separados da consulta. A geração em `src/generation/llm.py` usa a API nativa de chat do Ollama no host indicado por `TAILSCALE_MODEL_HOST` (URL ou host/porta, normalmente com a porta padrão do Ollama). Se houver exatamente um modelo instalado, ele é selecionado automaticamente. Com mais de um modelo, informe `model_name` ao criar `OllamaClient`.
 
@@ -273,9 +283,10 @@ O comando é um *dry-run* para os três primeiros documentos do índice; remova 
 
 ```text
 .
+├── app.py
 ├── README.md
 ├── requirements.txt
-├── .env.example
+├── .env.exemple
 ├── .gitignore
 ├── AGENTS.md
 ├── .github/
@@ -289,7 +300,6 @@ O comando é um *dry-run* para os três primeiros documentos do índice; remova 
 │   ├── raw/
 │   └── processed/
 ├── src/
-│   ├── api/
 │   ├── ingestion/
 │   ├── graph/
 │   ├── retrieval/
@@ -321,7 +331,7 @@ Esta é uma estrutura-alvo, não uma afirmação de que todos os diretórios já
 - [ ] GraphRAG executa Cypher e demonstra ao menos uma travessia multi-hop.
 - [ ] Recuperação híbrida combina e deduplica resultados vetoriais e do grafo.
 - [ ] KAG fornece ao LLM fatos, relações, datas e evidências rastreáveis.
-- [ ] API retorna fontes, nós, arestas, Cypher e métricas disponíveis.
+- [ ] Aplicação exibe fontes, nós, arestas, Cypher e métricas disponíveis.
 - [ ] Quando não há evidência, o sistema declara a insuficiência em vez de fabricar resposta.
 - [ ] Testes cobrem casos positivos, ausência de evidência e relações temporais.
 
