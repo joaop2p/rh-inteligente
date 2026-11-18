@@ -25,7 +25,7 @@ Permitir que usuários façam perguntas sobre a estrutura organizacional e os do
 - Decisões automáticas sobre contratação, demissão, promoção ou medidas disciplinares.
 - Uso de dados reais de colaboradores.
 
-A especificação acadêmica exige, na entrega final, interface funcional, visualização interativa do subgrafo e apresentação de rastreabilidade. A aplicação Streamlit é o ponto de interação do sistema monolítico; busca e visualização de evidências ainda serão integradas.
+A especificação acadêmica exige, na entrega final, interface funcional, visualização interativa do subgrafo e apresentação de rastreabilidade. A aplicação Streamlit é o ponto de interação do sistema monolítico; busca (RAG, GraphRAG e KAG) e exibição de fontes, caminhos e Cypher já estão integradas, enquanto a visualização interativa do subgrafo continua pendente.
 
 ## 3. Arquitetura conceitual
 
@@ -304,7 +304,7 @@ with Neo4jDatabase.from_env() as graph:
 
 `src/rag/pipeline.py` usa os resultados como candidatos documentais e solicita ao Ollama JSON com status, resposta e citações. Se o filtro configurado não deixar chunks, o pipeline retorna insuficiência sem chamar o LLM. A instrução restringe o modelo a RH da NovaTech e às evidências daquela pergunta; o histórico de conversa não é enviado como prova. Respostas citadas são aceitas somente se os pares `doc_id`/`chunk_id` existirem entre os trechos recuperados. `RAGSource.text` é o texto completo do chunk citado, não uma frase extraída ou validada como citação literal. Sem resultados, o LLM não é chamado; se o modelo marcar insuficiência, o pipeline retorna a mensagem fixa sem fontes.
 
-Isso não garante, por si só, a validade semântica da resposta: o modelo ainda pode classificar incorretamente um trecho como suficiente. A qualidade da relevância e a insuficiência semântica ainda precisam de avaliação mais abrangente. O fluxo GraphRAG/KAG atual cobre somente a hierarquia por `REPORTS_TO`; outras consultas estruturadas, algoritmos de grafo e visualização interativa continuam pendentes.
+Isso não garante, por si só, a validade semântica da resposta: o modelo ainda pode classificar incorretamente um trecho como suficiente. A qualidade da relevância e a insuficiência semântica ainda precisam de avaliação mais abrangente. O fluxo GraphRAG/KAG atual cobre a hierarquia por `REPORTS_TO` (subordinados, gestor direto, caminho entre pessoas) e a resolução do CEO por `OCUPA_CARGO`; outras consultas estruturadas, algoritmos de grafo e visualização interativa continuam pendentes.
 
 Para testar a busca contra o Neo4j configurado e o modelo BGE-M3 real, com os dados saneados já carregados:
 

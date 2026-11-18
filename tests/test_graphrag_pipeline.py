@@ -908,3 +908,21 @@ def test_graphrag_does_not_treat_generic_between_as_path_request() -> None:
 
     assert graph_search.path_calls == []
     assert response.status == "insufficient"
+
+
+def test_deterministic_dismissals_skip_documents_without_extractable_name() -> None:
+    from src.rag.kag_pipeline import _deterministic_desligamentos
+
+    evidence = (
+        DocumentEvidence(
+            doc_id="DOC-X",
+            chunk_id="DOC-X_chunk_001",
+            text="Texto genérico sem identificação de pessoa.",
+            matched_terms=("rescisao",),
+            title="Termo de Rescisão de Contrato de Trabalho",
+            document_type="Termo de Rescisão",
+            category="Rescisao",
+        ),
+    )
+
+    assert _deterministic_desligamentos("Quem foi desligado?", evidence) is None

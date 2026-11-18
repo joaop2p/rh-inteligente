@@ -148,11 +148,10 @@ def _deterministic_desligamentos(
                 item.text,
                 flags=re.IGNORECASE,
             )
-            name = (
-                re.sub(r"\s+", " ", name_match.group(1)).strip()
-                if name_match
-                else item.title
-            )
+            if not name_match:
+                # Sem nome extraível, não apresentar o título como pessoa.
+                continue
+            name = re.sub(r"\s+", " ", name_match.group(1)).strip()
             funcionario_id = ""
         seen_docs.add(item.doc_id)
         records.append((name, funcionario_id, item.doc_id))
