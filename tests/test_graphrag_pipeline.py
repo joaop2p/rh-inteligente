@@ -260,6 +260,73 @@ def test_kag_uses_document_metadata_when_vector_search_is_empty() -> None:
     assert response.knowledge_package["document_chunks"][0]["doc_id"] == "DOC-055"
 
 
+def test_kag_prefers_rescission_document_over_contract_for_desligamentos() -> None:
+    search = FakeSearch([])
+    evidence = (
+        DocumentEvidence(
+            doc_id="DOC-041",
+            chunk_id="DOC-041_chunk_001",
+            text=(
+                "TERMO DE RESCISÃO – DISPENSA SEM JUSTA CAUSA\n"
+                "FUNCIONÁRIO: Lucas Henrique Pinto (ID E012)"
+            ),
+            matched_terms=("desligamento", "rescisao"),
+            title="Termo de Rescisão",
+            document_type="Termo de Rescisão (TRCT)",
+            category="Rescisão",
+        ),
+        DocumentEvidence(
+            doc_id="DOC-047",
+            chunk_id="DOC-047_chunk_001",
+            text=(
+                "TERMO DE RESCISÃO – JUSTA CAUSA\n"
+                "FUNCIONÁRIO: Diego Ramos Falcão (ID E018)"
+            ),
+            matched_terms=("desligamento", "rescisao"),
+            title="Termo de Rescisão",
+            document_type="Termo de Rescisão (TRCT)",
+            category="Rescisão",
+        ),
+        DocumentEvidence(
+            doc_id="DOC-049",
+            chunk_id="DOC-049_chunk_001",
+            text=(
+                "TERMO DE RESCISÃO – PEDIDO DE DEMISSÃO\n"
+                "FUNCIONÁRIO: Natália Cordeiro Peixoto (ID E027)"
+            ),
+            matched_terms=("desligamento", "demissao"),
+            title="Termo de Demissão",
+            document_type="Termo de Rescisão (TRCT)",
+            category="Rescisão",
+        ),
+    )
+    graph_search = FakeGraphSearch(
+        (),
+        _graph_result(paths=(), evidence=()),
+        document_evidence=evidence,
+    )
+    llm = FakeLLM(
+        {
+            "status": "insufficient",
+            "answer": "sem evidências",
+            "citations": [],
+        }
+    )
+
+    response = KAGPipeline(search, graph_search, llm).answer(
+        "Quais desligamentos foram registrados?",
+        as_of=date(2025, 1, 1),
+        document_scope="ORGANIZACAO",
+    )
+
+    assert response.status == "answered"
+    assert response.sources[0].doc_id == "DOC-041"
+    assert "Lucas Henrique Pinto" in response.answer
+    assert "Diego Ramos Falcão" in response.answer
+    assert "Natália Cordeiro Peixoto" in response.answer
+    assert "Juliana Barbosa Reis" not in response.answer
+
+
 def test_pipeline_fuses_graph_and_vector_chunks_and_validates_citations() -> None:
     chunk_text = "  Chunk ligado à pessoa do caminho."
     graph_result = _graph_result(

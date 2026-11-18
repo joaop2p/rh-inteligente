@@ -146,6 +146,24 @@ def test_pipeline_returns_insufficient_if_all_vector_scores_are_below_threshold(
     )
 
 
+def test_pipeline_treats_bare_document_object_as_insufficient() -> None:
+    search = FakeSearch([retrieved_chunk()])
+    llm = FakeLLM(
+        json.dumps(
+            {
+                "doc_id": "DOC-057",
+                "chunk_id": "DOC-057_chunk_001",
+                "text": "Texto de advertência.",
+            }
+        )
+    )
+
+    result = RAGPipeline(search, llm).answer("Pergunta hierárquica?")
+
+    assert result.status == "insufficient"
+    assert result.sources == []
+
+
 def test_pipeline_uses_chunks_at_or_above_threshold_normally() -> None:
     search = FakeSearch([retrieved_chunk()])
     llm = FakeLLM(

@@ -188,14 +188,8 @@ class RAGPipeline:
                 and isinstance(payload.get("chunk_id"), str)
                 and isinstance(payload.get("text"), str)
             ):
-                payload["status"] = "answered"
-                payload["answer"] = payload["text"]
-                payload["citations"] = [
-                    {
-                        "doc_id": payload["doc_id"],
-                        "chunk_id": payload["chunk_id"],
-                    }
-                ]
+                payload["status"] = "insufficient"
+                payload["citations"] = []
         return payload
 
     @staticmethod

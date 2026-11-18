@@ -136,11 +136,25 @@ WITH document, chunk,
        ] |
        replace(normalized, pair[0], pair[1])
      ) AS searchable
-WHERE any(term IN $terms WHERE searchable CONTAINS term)
+WHERE
+    ($topic_type IS NULL AND
+     any(term IN $terms WHERE searchable CONTAINS term))
+    OR ($topic_type = 'desligamento' AND
+        (toLower(document.categoria) = 'rescisao'
+         OR toLower(document.tipo) CONTAINS 'rescis'))
+    OR ($topic_type = 'ferias' AND
+        (toLower(document.tipo) CONTAINS 'ferias'
+         OR toLower(document.categoria) = 'afastamento'))
+    OR ($topic_type = 'promocao' AND
+        (toLower(document.tipo) CONTAINS 'promoc'
+         OR searchable CONTAINS 'promoc'))
 RETURN
     document.doc_id AS doc_id,
     chunk.chunk_id AS chunk_id,
     chunk.texto AS text,
+    document.titulo AS titulo,
+    document.tipo AS tipo,
+    document.categoria AS categoria,
     searchable
 LIMIT 30
 """
@@ -214,6 +228,9 @@ class DocumentEvidence:
     chunk_id: str
     text: str
     matched_terms: tuple[str, ...]
+    title: str = ""
+    document_type: str = ""
+    category: str = ""
 
 
 @dataclass(frozen=True)
@@ -403,6 +420,46 @@ def _document_search_terms(text: str) -> tuple[str, ...]:
     return tuple(sorted(term for term in terms if term))
 
 
+def _document_topic_type(text: str) -> str | None:
+    normalized = _normalize_search_text(text)
+    if any(
+        term in normalized
+        for term in ("desligamento", "rescisao", "demissao")
+    ):
+        return "desligamento"
+    if "ferias" in normalized:
+        return "ferias"
+    if "promocao" in normalized or "promocoes" in normalized:
+        return "promocao"
+    return None
+
+
+def _document_topic_rank(question: str, item: DocumentEvidence) -> int:
+    normalized = _normalize_search_text(question)
+    metadata = _normalize_search_text(
+        " ".join((item.title, item.document_type, item.category))
+    )
+    if "ferias" in normalized:
+        if "aviso de ferias" in metadata or "ferias" in metadata:
+            return 300
+        if "afastamento" in metadata:
+            return 50
+        if "rescisao" in metadata:
+            return 10
+    if any(
+        term in normalized
+        for term in ("desligamento", "rescisao", "demissao", "dispensa")
+    ):
+        if "trct" in metadata or "rescisao" in metadata or "demissao" in metadata:
+            return 300
+        if "contrato de trabalho" in metadata:
+            return 10
+    if "promocao" in normalized or "promocoes" in normalized:
+        if "cargo" in metadata or "promocao" in metadata:
+            return 300
+    return len(item.matched_terms)
+
+
 class GraphSearch:
     """Executa travessias permitidas e retorna caminhos com proveniência."""
 
@@ -423,6 +480,7 @@ class GraphSearch:
             {
                 "terms": terms,
                 "document_scope": document_scope,
+                "topic_type": _document_topic_type(text),
             },
         )
         evidence: dict[tuple[str, str], DocumentEvidence] = {}
@@ -431,6 +489,9 @@ class GraphSearch:
             chunk_id = record.get("chunk_id")
             chunk_text = record.get("text")
             searchable = record.get("searchable")
+            title = record.get("titulo")
+            document_type = record.get("tipo")
+            category = record.get("categoria")
             if not isinstance(doc_id, str) or not isinstance(chunk_id, str):
                 continue
             if not isinstance(chunk_text, str) or not chunk_text.strip():
@@ -444,12 +505,19 @@ class GraphSearch:
                 chunk_id=chunk_id,
                 text=chunk_text,
                 matched_terms=matches,
+                title=title if isinstance(title, str) else "",
+                document_type=(
+                    document_type if isinstance(document_type, str) else ""
+                ),
+                category=(
+                    category if isinstance(category, str) else ""
+                ),
             )
         return tuple(
             sorted(
                 evidence.values(),
                 key=lambda item: (
-                    -len(item.matched_terms),
+                    -_document_topic_rank(text, item),
                     item.doc_id,
                     item.chunk_id,
                 ),
